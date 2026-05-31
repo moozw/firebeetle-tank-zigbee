@@ -1,10 +1,14 @@
 [
   {
+    "fileName": "tank2_v1.0.8.ota",
     "fileVersion": 16777224,
     "fileSize": 714398,
     "manufacturerCode": 4644,
     "imageType": 4113,
     "sha512": "974a07caa720dcb1d8cc7eef1bb42e109fd4728d836bedf3d9d91d9f9a44fef9c990d2605766c1fd5c43d9034c9a2b4f32ec3305fe0060d7ad1ee1ba1ace3cc8",
-    "url": "https://raw.githubusercontent.com/moozw/firebeetle-tank-zigbee/main/ota/tank2_v1.0.8.ota"
+    "url": "https://raw.githubusercontent.com/moozw/firebeetle-tank-zigbee/main/ota/tank2_v1.0.8.ota",
+    "otaHeaderString": "FB2-C5-TANK",
+    "originalUrl": "https://github.com/moozw/firebeetle-tank-zigbee/blob/main/ota/tank2_v1.0.8.ota",
+    "releaseNotes": "Active Zigbee OTA query bootstrap for ESP32-C5 tank controller."
   }
 ]
