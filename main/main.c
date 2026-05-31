@@ -27,6 +27,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_zigbee_core.h"
+#include "esp_zigbee_ota.h"
 
 #include "app_config.h"
 #include "lps2x.h"
@@ -478,6 +479,14 @@ static esp_err_t ota_value_cb(esp_zb_zcl_ota_upgrade_value_message_t msg)
     return ESP_OK;
 }
 
+static void ota_query_cb(uint8_t arg)
+{
+    (void)arg;
+    esp_err_t err = esp_zb_ota_upgrade_client_query_image_req(OTA_SERVER_ADDR, OTA_SERVER_ENDPOINT);
+    ESP_LOGI(TAG, "OTA query -> %s", esp_err_to_name(err));
+    esp_zb_scheduler_alarm(ota_query_cb, 0, OTA_QUERY_INTERVAL_MIN * 60 * 1000);
+}
+
 /* --------------------------- Zigbee write handler ----------------------- */
 static esp_err_t zb_set_attr_cb(const esp_zb_zcl_set_attr_value_message_t *m)
 {
@@ -508,6 +517,11 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t cb_id, const
         return zb_set_attr_cb((const esp_zb_zcl_set_attr_value_message_t *)message);
     } else if (cb_id == ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID) {
         return ota_value_cb(*(esp_zb_zcl_ota_upgrade_value_message_t *)message);
+    } else if (cb_id == ESP_ZB_CORE_OTA_UPGRADE_QUERY_IMAGE_RESP_CB_ID) {
+        const esp_zb_zcl_ota_upgrade_query_image_resp_message_t *m =
+            (const esp_zb_zcl_ota_upgrade_query_image_resp_message_t *)message;
+        ESP_LOGI(TAG, "OTA query response: status=%d version=0x%08x size=%u",
+                 m->query_status, (unsigned)m->file_version, (unsigned)m->image_size);
     }
     return ESP_OK;
 }
@@ -611,7 +625,7 @@ static void esp_zb_task(void *arg)
     };
     esp_zb_attribute_list_t *ota = esp_zb_ota_cluster_create(&ota_cfg);
     esp_zb_zcl_ota_upgrade_client_variable_t ota_var = {
-        .timer_query = ESP_ZB_ZCL_OTA_UPGRADE_QUERY_TIMER_COUNT_DEF,
+        .timer_query = OTA_QUERY_INTERVAL_MIN,
         .hw_version = OTA_HW_VERSION,
         .max_data_size = OTA_MAX_DATA_SIZE,
     };
@@ -659,6 +673,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
                 ESP_LOGI(TAG, "rejoined existing network");
                 g_zb_joined = true;
                 g_join_us = esp_timer_get_time();
+                esp_zb_ota_upgrade_client_query_interval_set(ZB_ENDPOINT, OTA_QUERY_INTERVAL_MIN);
+                esp_zb_scheduler_alarm_cancel(ota_query_cb, 0);
+                esp_zb_scheduler_alarm(ota_query_cb, 0, OTA_QUERY_DELAY_MS);
             }
         } else {
             ESP_LOGW(TAG, "init failed (%s), retrying", esp_err_to_name(err));
@@ -674,6 +691,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
             esp_zb_get_long_address(ext);
             ESP_LOGI(TAG, "joined, PAN 0x%04hx, ch %d", esp_zb_get_pan_id(),
                      esp_zb_get_current_channel());
+            esp_zb_ota_upgrade_client_query_interval_set(ZB_ENDPOINT, OTA_QUERY_INTERVAL_MIN);
+            esp_zb_scheduler_alarm_cancel(ota_query_cb, 0);
+            esp_zb_scheduler_alarm(ota_query_cb, 0, OTA_QUERY_DELAY_MS);
         } else {
             ESP_LOGW(TAG, "no network found, retrying steering");
             esp_zb_scheduler_alarm((esp_zb_callback_t)esp_zb_bdb_start_top_level_commissioning,
