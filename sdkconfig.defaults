@@ -1,0 +1,22 @@
+# ---- Zigbee (router, mains powered) ----
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZCZR=y
+CONFIG_ZB_RADIO_NATIVE=y
+
+# ---- 802.15.4 radio ----
+CONFIG_IEEE802154_ENABLED=y
+
+# ---- flash size (4 MB, needed for dual OTA app slots) ----
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# ---- partition table ----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- misc ----
+CONFIG_FREERTOS_HZ=1000
+CONFIG_PM_ENABLE=n
+
+# ---- let flash erase/write suspend so the radio cache keeps running during OTA ----
+CONFIG_SPI_FLASH_AUTO_SUSPEND=y

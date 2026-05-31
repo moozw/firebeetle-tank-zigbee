@@ -1,0 +1,160 @@
+// Zigbee2MQTT external converter — FireBeetle 2 ESP32-C5 tank controller.
+// Classic fromZigbee/toZigbee format for maximum Z2M-version compatibility.
+//
+// Install:  copy to <z2m-data>/external_converters/firebeetle_tank.js, restart Z2M,
+//           then "Reconfigure" the device once (sets up reporting).
+//
+// Custom cluster 0xFC11 (51217) attribute IDs:
+//   0x00 depth(cm,s16 RO)  0x01 level(%,u8 RO)  0x02 fault(u8 RO)
+//   0x03 baro_pressure(hPa,s16 RO)  0x04 tank_pressure(hPa,s16 RO)
+//   0x10 level_low(cm,s16) 0x11 level_full(cm,s16) 0x12 tank_height(cm,s16)
+//   0x13 density(kg/m3,u16) 0x14 mode(u8: 0 auto/1 force_on/2 force_off)
+
+const fz = require('zigbee-herdsman-converters/converters/fromZigbee');
+const tz = require('zigbee-herdsman-converters/converters/toZigbee');
+const reporting = require('zigbee-herdsman-converters/lib/reporting');
+const exposes = require('zigbee-herdsman-converters/lib/exposes');
+const e = exposes.presets;
+const ea = exposes.access;
+
+const CLUSTER = 0xFC11;
+const PRESSURE_CLUSTER = 0x0403;
+const MANUFACTURER_CODE = 0x1224;
+const MODE_MAP = {0: 'auto', 1: 'force_on', 2: 'force_off'};
+const MODE_REV = {auto: 0, force_on: 1, force_off: 2};
+const S16 = 0x29, U16 = 0x21, U8 = 0x20;
+
+const firstDefined = (data, keys) => {
+    for (const key of keys) {
+        if (data[key] !== undefined) return data[key];
+    }
+    return undefined;
+};
+
+const fzTank = {
+    cluster: CLUSTER,
+    type: ['attributeReport', 'readResponse'],
+    convert: (model, msg, publish, options, meta) => {
+        const d = msg.data;
+        const r = {};
+        const depth = firstDefined(d, ['0', 'attr0']);
+        const level = firstDefined(d, ['1', 'attr1']);
+        const fault = firstDefined(d, ['2', 'attr2']);
+        const baroPressure = firstDefined(d, ['3', 'attr3']);
+        const tankPressure = firstDefined(d, ['4', 'attr4']);
+        if (depth     !== undefined) r.depth       = depth;
+        if (level     !== undefined) r.level       = level;
+        if (fault     !== undefined) r.fault       = fault ? 'ON' : 'OFF';
+        if (baroPressure !== undefined) r.baro_pressure = baroPressure;
+        if (tankPressure !== undefined) r.tank_pressure = tankPressure;
+        if (d['16'] !== undefined) r.level_low    = d['16'];
+        if (d['17'] !== undefined) r.level_full   = d['17'];
+        if (d['18'] !== undefined) r.tank_height  = d['18'];
+        if (d['19'] !== undefined) r.density       = d['19'];
+        if (d['20'] !== undefined) r.mode          = MODE_MAP[d['20']];
+        return r;
+    },
+};
+
+const fzPressure = {
+    cluster: 'msPressureMeasurement',
+    type: ['attributeReport', 'readResponse'],
+    convert: (model, msg, publish, options, meta) => {
+        const d = msg.data;
+        const r = {};
+        if (d.measuredValue !== undefined) r.baro_pressure = d.measuredValue;
+        if (d.scaledValue !== undefined) r.tank_pressure = d.scaledValue;
+        return r;
+    },
+};
+
+// settable config attributes
+const tzTank = {
+    key: ['level_low', 'level_full', 'tank_height', 'density', 'mode'],
+    convertSet: async (entity, key, value, meta) => {
+        const W = {
+            level_low:   [0x10, S16], level_full:  [0x11, S16],
+            tank_height: [0x12, S16], density:     [0x13, U16], mode: [0x14, U8],
+        };
+        const [attr, type] = W[key];
+        const raw = key === 'mode' ? MODE_REV[value] : value;
+        await entity.write(CLUSTER, {[attr]: {value: raw, type}}, {manufacturerCode: MANUFACTURER_CODE});
+        return {state: {[key]: value}};
+    },
+    convertGet: async (entity, key, meta) => {
+        const R = {level_low: 0x10, level_full: 0x11, tank_height: 0x12, density: 0x13, mode: 0x14};
+        await entity.read(CLUSTER, [R[key]], {manufacturerCode: MANUFACTURER_CODE});
+    },
+};
+
+// read-only telemetry (refresh button reads it on demand)
+const tzTankRead = {
+    key: ['depth', 'level', 'fault', 'baro_pressure', 'tank_pressure'],
+    convertGet: async (entity, key, meta) => {
+        if (key === 'baro_pressure') {
+            await entity.read(PRESSURE_CLUSTER, [0x0000]);
+            return;
+        }
+        if (key === 'tank_pressure') {
+            await entity.read(PRESSURE_CLUSTER, [0x0010]);
+            return;
+        }
+        const R = {depth: 0x00, level: 0x01, fault: 0x02, baro_pressure: 0x03, tank_pressure: 0x04};
+        await entity.read(CLUSTER, [R[key]], {manufacturerCode: MANUFACTURER_CODE});
+    },
+};
+
+module.exports = [
+    {
+        zigbeeModel: ['ESP32C5'],
+        model: 'FB2-C5-TANK',
+        vendor: 'DIY',
+        description: 'FireBeetle 2 ESP32-C5 underwater tank level / fill relay',
+        ota: true,                 // enable wireless firmware updates (served from the OTA override index)
+        fromZigbee: [fz.on_off, fzTank, fzPressure],
+        toZigbee: [tz.on_off, tzTank, tzTankRead],
+        configure: async (device, coordinatorEndpoint) => {
+            const ep = device.getEndpoint(10);
+            // relay state reporting (standard cluster)
+            try { await ep.bind('genOnOff', coordinatorEndpoint); await reporting.onOff(ep); } catch (e) {}
+            try {
+                await ep.bind(PRESSURE_CLUSTER, coordinatorEndpoint);
+                await ep.configureReporting(PRESSURE_CLUSTER, [
+                    {attribute: {ID: 0x0000, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
+                    {attribute: {ID: 0x0010, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
+                ]);
+            } catch (e) {}
+            // custom telemetry auto-reporting (best effort)
+            try {
+                await ep.bind(CLUSTER, coordinatorEndpoint);
+                await ep.configureReporting(CLUSTER, [
+                    {attribute: {ID: 0x00, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
+                    {attribute: {ID: 0x01, type: U8},  minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
+                    {attribute: {ID: 0x02, type: U8},  minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
+                    {attribute: {ID: 0x03, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
+                    {attribute: {ID: 0x04, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
+                ], {manufacturerCode: MANUFACTURER_CODE});
+            } catch (e) {}
+        },
+        exposes: [
+            e.switch(),
+            e.numeric('depth', ea.STATE_GET).withUnit('cm').withDescription('Water depth above sensor'),
+            e.numeric('level', ea.STATE_GET).withUnit('%').withDescription('Tank level'),
+            e.binary('fault', ea.STATE_GET, 'ON', 'OFF').withDescription('Sensor fault (pump forced off)'),
+            e.numeric('baro_pressure', ea.STATE_GET).withUnit('hPa')
+                .withDescription('Barometric reference pressure'),
+            e.numeric('tank_pressure', ea.STATE_GET).withUnit('hPa')
+                .withDescription('Tank sensor absolute pressure'),
+            e.numeric('level_low', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
+                .withDescription('Pump turns ON at/below this depth'),
+            e.numeric('level_full', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
+                .withDescription('Pump turns OFF at/above this depth'),
+            e.numeric('tank_height', ea.ALL).withUnit('cm').withValueMin(1).withValueMax(500)
+                .withDescription('Full-scale height used for level %'),
+            e.numeric('density', ea.ALL).withUnit('kg/m3').withValueMin(900).withValueMax(1100)
+                .withDescription('Liquid density (fresh ~997, sea ~1025)'),
+            e.enum('mode', ea.ALL, ['auto', 'force_on', 'force_off'])
+                .withDescription('Control mode / manual override'),
+        ],
+    },
+];

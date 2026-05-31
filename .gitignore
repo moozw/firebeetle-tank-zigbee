@@ -1,0 +1,31 @@
+# ESP-IDF build outputs
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+
+# Generated firmware and flash artifacts
+*.bin
+*.elf
+*.map
+*.ota
+ff_*.bin
+
+# Local logs
+*.log
+
+# Local Zigbee2MQTT/MQTT bench helpers
+zigbee2mqtt/get.js
+zigbee2mqtt/ota_check.js
+zigbee2mqtt/ota_update.js
+zigbee2mqtt/setmode.js
+zigbee2mqtt/tankchk.js
+zigbee2mqtt/tanktest.js
+zigbee2mqtt/ota_index.json
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
