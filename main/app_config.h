@@ -52,11 +52,19 @@
 #define SENSOR_AVG_SAMPLES      3      /* one-shot readings per displayed sample */
 #define SENSOR_AVG_DELAY_MS     250    /* rest between one-shot conversions      */
 #define MAX_DEPTH_OVER_TANK_CM  20     /* depth above tank height => fault       */
-#define BENCH_REQUIRE_EQUAL_PRESSURE 1  /* set 0 when tank sensor is underwater   */
+#define BENCH_REQUIRE_EQUAL_PRESSURE 0  /* setup calibration now handles offsets  */
 #define BENCH_MAX_DELTA_HPA     10.0f  /* both sensors in air should be close    */
 #define PUMP_MIN_OFF_MS         30000  /* anti-short-cycle: min rest before re-ON */
 #define PUMP_MIN_ON_MS          0      /* optional min run time (0 = disabled)  */
 #define LOG_SENSOR_READINGS     1      /* diagnostic serial log of pressure/depth */
+
+/* ---------- Local setup portal ---------- */
+/* First-pass installer UI: phone connects to this AP and opens http://192.168.4.1.
+ * It stores calibration/config in the same NVS blob used by Zigbee. */
+#define SETUP_PORTAL_ENABLE     1
+#define SETUP_AP_SSID_PREFIX    "TankSetup"
+#define SETUP_AP_CHANNEL        6
+#define SETUP_AP_MAX_CONN       2
 
 /* ---------- Zigbee ---------- */
 #define ZB_ENDPOINT             10
@@ -81,14 +89,21 @@
 #define MODE_ON     1
 #define MODE_OFF    2
 
+/* connectivity preference saved by setup UI; current firmware still starts
+ * Zigbee and setup AP, but this records the intended operating mode. */
+#define CONN_STANDALONE 0
+#define CONN_ZIGBEE     1
+#define CONN_WIFI       2
+#define CONN_BOTH       3
+
 /* ---------- OTA (wireless firmware update over Zigbee) ---------- */
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x0100000A   /* 1.0.0.10 - OTA bootstrap, no active query */
+#define OTA_FW_VERSION      0x0100000B   /* 1.0.0.11 - setup portal calibration */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101
 #define OTA_MAX_DATA_SIZE   223          /* max OTA block payload bytes */
 #define OTA_QUERY_INTERVAL_MIN 5         /* client retry interval        */
-#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.10"
+#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.11"
