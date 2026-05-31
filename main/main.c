@@ -27,7 +27,6 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_zigbee_core.h"
-#include "esp_zigbee_ota.h"
 
 #include "app_config.h"
 #include "lps2x.h"
@@ -479,14 +478,6 @@ static esp_err_t ota_value_cb(esp_zb_zcl_ota_upgrade_value_message_t msg)
     return ESP_OK;
 }
 
-static void ota_query_cb(uint8_t arg)
-{
-    (void)arg;
-    esp_err_t err = esp_zb_ota_upgrade_client_query_image_req(OTA_SERVER_ADDR, OTA_SERVER_ENDPOINT);
-    ESP_LOGI(TAG, "OTA query -> %s", esp_err_to_name(err));
-    esp_zb_scheduler_alarm(ota_query_cb, 0, OTA_QUERY_INTERVAL_MIN * 60 * 1000);
-}
-
 /* --------------------------- Zigbee write handler ----------------------- */
 static esp_err_t zb_set_attr_cb(const esp_zb_zcl_set_attr_value_message_t *m)
 {
@@ -587,6 +578,7 @@ static void esp_zb_task(void *arg)
     /* ZCL char strings are length-prefixed; these let Z2M match the converter */
     esp_zb_basic_cluster_add_attr(basic, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, "\x03""DIY");
     esp_zb_basic_cluster_add_attr(basic, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, "\x07""ESP32C5");
+    esp_zb_basic_cluster_add_attr(basic, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID, OTA_VERSION_ZCL_STRING);
     esp_zb_cluster_list_add_basic_cluster(clusters, basic, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_identify_cluster(clusters,
         esp_zb_identify_cluster_create(&ident_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
@@ -673,9 +665,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
                 ESP_LOGI(TAG, "rejoined existing network");
                 g_zb_joined = true;
                 g_join_us = esp_timer_get_time();
-                esp_zb_ota_upgrade_client_query_interval_set(ZB_ENDPOINT, OTA_QUERY_INTERVAL_MIN);
-                esp_zb_scheduler_alarm_cancel(ota_query_cb, 0);
-                esp_zb_scheduler_alarm(ota_query_cb, 0, OTA_QUERY_DELAY_MS);
             }
         } else {
             ESP_LOGW(TAG, "init failed (%s), retrying", esp_err_to_name(err));
@@ -691,9 +680,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
             esp_zb_get_long_address(ext);
             ESP_LOGI(TAG, "joined, PAN 0x%04hx, ch %d", esp_zb_get_pan_id(),
                      esp_zb_get_current_channel());
-            esp_zb_ota_upgrade_client_query_interval_set(ZB_ENDPOINT, OTA_QUERY_INTERVAL_MIN);
-            esp_zb_scheduler_alarm_cancel(ota_query_cb, 0);
-            esp_zb_scheduler_alarm(ota_query_cb, 0, OTA_QUERY_DELAY_MS);
         } else {
             ESP_LOGW(TAG, "no network found, retrying steering");
             esp_zb_scheduler_alarm((esp_zb_callback_t)esp_zb_bdb_start_top_level_commissioning,

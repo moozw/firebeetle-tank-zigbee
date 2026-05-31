@@ -1,14 +1,14 @@
 [
   {
-    "fileName": "tank2_v1.0.8.ota",
-    "fileVersion": 16777224,
-    "fileSize": 714398,
+    "fileName": "tank2_v1.0.10.ota",
+    "fileVersion": 16777226,
+    "fileSize": 713486,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "974a07caa720dcb1d8cc7eef1bb42e109fd4728d836bedf3d9d91d9f9a44fef9c990d2605766c1fd5c43d9034c9a2b4f32ec3305fe0060d7ad1ee1ba1ace3cc8",
-    "url": "https://raw.githubusercontent.com/moozw/firebeetle-tank-zigbee/main/ota/tank2_v1.0.8.ota",
+    "sha512": "f6981efeaf6fb5c687a582bc09d92dc1d71a2a2a9de683c5313fe3aa834b8bfd1ab762c97daa6be657a3a1d15608f8f979836334513c59ce088003583d9dfef2",
+    "url": "https://raw.githubusercontent.com/moozw/firebeetle-tank-zigbee/main/ota/tank2_v1.0.10.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "originalUrl": "https://github.com/moozw/firebeetle-tank-zigbee/blob/main/ota/tank2_v1.0.8.ota",
-    "releaseNotes": "Active Zigbee OTA query bootstrap for ESP32-C5 tank controller."
+    "originalUrl": "https://github.com/moozw/firebeetle-tank-zigbee/blob/main/ota/tank2_v1.0.10.ota",
+    "releaseNotes": "Stable Zigbee OTA bootstrap with friendly firmware metadata."
   }
 ]
