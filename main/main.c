@@ -17,6 +17,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -174,11 +175,30 @@ static void cfg_save(void)
     nvs_close(h);
 }
 
+/* In-place URL-decode of an x-www-form-urlencoded value (%XX escapes and '+'). */
+static void url_decode(char *s)
+{
+    char *o = s;
+    for (char *p = s; *p; p++) {
+        if (*p == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+            char hex[3] = { p[1], p[2], '\0' };
+            *o++ = (char)strtol(hex, NULL, 16);
+            p += 2;
+        } else if (*p == '+') {
+            *o++ = ' ';
+        } else {
+            *o++ = *p;
+        }
+    }
+    *o = '\0';
+}
+
 static void copy_form_str(const char *form, const char *key, char *dst, size_t dst_len)
 {
     char val[96];
     if (dst_len == 0) return;
     if (httpd_query_key_value(form, key, val, sizeof(val)) == ESP_OK) {
+        url_decode(val);                 /* httpd_query_key_value does NOT decode */
         strlcpy(dst, val, dst_len);
     }
 }
@@ -534,7 +554,7 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "<label>WiFi SSID<input id=ssid></label><label>WiFi password<input id=wpass type=password autocomplete=off></label>"
         "<label>MQTT broker IP/host<input id=mh placeholder='192.168.1.10'></label><label>MQTT topic<input id=mt></label>"
         "<label>MQTT user<input id=mu></label><label>MQTT password<input id=mp type=password autocomplete=off></label>"
-        "</div><button onclick=save()>Save parameters</button></section><p id=msg></p></main><script>"
+        "</div><button onclick=save()>Save parameters</button> <button onclick=saveReboot()>Save &amp; reboot</button></section><p id=msg></p></main><script>"
         "const $=id=>document.getElementById(id);"
         "let editing=false;"
         "function bindEdits(){['low','op','full','height','density','mode','conn','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>editing=true;$(id).onchange=()=>editing=true})}"
@@ -546,7 +566,8 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "$('cal').innerHTML=s.calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';"
         "if(!editing)syncForm(s)}"
         "async function post(u){let r=await fetch(u,{method:'POST'});$('msg').textContent=await r.text();editing=false;load()}"
-        "async function save(){let q=new URLSearchParams({low:$('low').value,op:$('op').value,full:$('full').value,height:$('height').value,density:$('density').value,mode:$('mode').value,conn:$('conn').value,ssid:$('ssid').value,wpass:$('wpass').value,mh:$('mh').value,mu:$('mu').value,mp:$('mp').value,mt:$('mt').value});let r=await fetch('/api/config',{method:'POST',body:q});$('msg').textContent=await r.text();if(r.ok){editing=false;$('wpass').value='';$('mp').value=''}load()}"
+        "async function save(){let q=new URLSearchParams({low:$('low').value,op:$('op').value,full:$('full').value,height:$('height').value,density:$('density').value,mode:$('mode').value,conn:$('conn').value,ssid:$('ssid').value,wpass:$('wpass').value,mh:$('mh').value,mu:$('mu').value,mp:$('mp').value,mt:$('mt').value});let r=await fetch('/api/config',{method:'POST',body:q});$('msg').textContent=await r.text();if(r.ok){editing=false;$('wpass').value='';$('mp').value=''}load();return r.ok}"
+        "async function saveReboot(){let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Saved — rebooting; reconnect to your WiFi shortly.'}}"
         "bindEdits();load();setInterval(load,3000)</script></body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -654,6 +675,20 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     return httpd_resp_sendstr(req, "Parameters saved");
 }
 
+static void reboot_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(800));   /* let the HTTP response flush first */
+    esp_restart();
+}
+
+static esp_err_t setup_reboot_post(httpd_req_t *req)
+{
+    httpd_resp_sendstr(req, "Rebooting");
+    ESP_LOGI(TAG, "reboot requested via setup portal");
+    xTaskCreate(reboot_task, "reboot", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
 static void web_server_start(void)
 {
     if (s_httpd) return;
@@ -665,6 +700,7 @@ static void web_server_start(void)
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/open_air", .method=HTTP_POST, .handler=setup_open_air_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/full_tank", .method=HTTP_POST, .handler=setup_full_tank_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/config", .method=HTTP_POST, .handler=setup_config_post });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/reboot", .method=HTTP_POST, .handler=setup_reboot_post });
 }
 
 static void setup_portal_start(void)
@@ -702,11 +738,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_connected = false;
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
+        /* reason codes: 15=4WAY_HANDSHAKE_TIMEOUT (bad password), 2=AUTH_EXPIRE,
+         * 201=NO_AP_FOUND, 200/205=beacon/connection loss (weak signal) */
         if (s_wifi_retry++ < WIFI_MAX_RETRY) {
-            ESP_LOGW(TAG, "WiFi disconnected, retry %d/%d", s_wifi_retry, WIFI_MAX_RETRY);
+            ESP_LOGW(TAG, "WiFi disconnected (reason %d), retry %d/%d", d->reason, s_wifi_retry, WIFI_MAX_RETRY);
             esp_wifi_connect();
         } else {
-            ESP_LOGE(TAG, "WiFi connect failed");
+            ESP_LOGE(TAG, "WiFi connect failed (reason %d)", d->reason);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
