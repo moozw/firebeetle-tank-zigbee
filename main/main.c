@@ -34,6 +34,8 @@
 #include "esp_check.h"
 #include "esp_wifi.h"
 #include "mqtt_client.h"
+#include "esp_https_ota.h"
+#include "esp_http_client.h"
 #include "esp_zigbee_core.h"
 
 #include "app_config.h"
@@ -271,6 +273,72 @@ static void mqtt_apply_command(const char *payload, int len)
     mqtt_publish_state();
 }
 
+/* ----------------------------- WiFi OTA --------------------------------- */
+/* Triggered by an MQTT message on <topic>/ota: {"url":"http://host/fw.bin"}.
+ * Uses esp_https_ota (handles partition/erase/write/verify/set-boot) - reuses
+ * the same ota_0/ota_1 slots as Zigbee OTA. Status -> <topic>/ota_status. */
+static char s_ota_url[256];
+
+static void mqtt_ota_publish(const char *json_status)
+{
+    if (!s_mqtt || !s_mqtt_connected) return;
+    cfg_t cfg;
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg = g_cfg;
+    xSemaphoreGive(g_cfg_mtx);
+    char topic[64];
+    snprintf(topic, sizeof(topic), "%s/ota_status", cfg.mqtt_topic[0] ? cfg.mqtt_topic : DEFAULT_MQTT_TOPIC);
+    esp_mqtt_client_publish(s_mqtt, topic, json_status, 0, 1, 0);
+}
+
+static void wifi_ota_task(void *arg)
+{
+    ESP_LOGI(TAG, "WiFi OTA from %s", s_ota_url);
+    mqtt_ota_publish("{\"state\":\"downloading\"}");
+    esp_http_client_config_t http = {
+        .url = s_ota_url,
+        .timeout_ms = 30000,
+        .keep_alive_enable = true,
+    };
+    esp_https_ota_config_t ota_cfg = { .http_config = &http };
+    esp_err_t err = esp_https_ota(&ota_cfg);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "WiFi OTA complete - rebooting");
+        mqtt_ota_publish("{\"state\":\"success\"}");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG, "WiFi OTA failed: %s", esp_err_to_name(err));
+        char msg[112];
+        snprintf(msg, sizeof(msg), "{\"state\":\"failed\",\"error\":\"%s\"}", esp_err_to_name(err));
+        mqtt_ota_publish(msg);
+        s_ota_active = false;
+    }
+    vTaskDelete(NULL);
+}
+
+static void mqtt_ota_trigger(const char *payload, int len)
+{
+    if (s_ota_active) { mqtt_ota_publish("{\"state\":\"busy\"}"); return; }
+    char json[320];
+    size_t n = len < (int)sizeof(json) - 1 ? (size_t)len : sizeof(json) - 1;
+    memcpy(json, payload, n);
+    json[n] = '\0';
+
+    char url[256];
+    if (!json_has(json, "url", url, sizeof(url)) ||
+        (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)) {
+        mqtt_ota_publish("{\"state\":\"failed\",\"error\":\"missing or invalid url\"}");
+        return;
+    }
+    strlcpy(s_ota_url, url, sizeof(s_ota_url));
+    s_ota_active = true;     /* pauses Zigbee telemetry during the download */
+    if (xTaskCreate(wifi_ota_task, "wifi_ota", 8192, NULL, 5, NULL) != pdPASS) {
+        s_ota_active = false;
+        mqtt_ota_publish("{\"state\":\"failed\",\"error\":\"task create\"}");
+    }
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
@@ -280,16 +348,25 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
         cfg = g_cfg;
         xSemaphoreGive(g_cfg_mtx);
+        const char *base_topic = cfg.mqtt_topic[0] ? cfg.mqtt_topic : DEFAULT_MQTT_TOPIC;
         char topic[64];
-        snprintf(topic, sizeof(topic), "%s/set", cfg.mqtt_topic[0] ? cfg.mqtt_topic : DEFAULT_MQTT_TOPIC);
+        snprintf(topic, sizeof(topic), "%s/set", base_topic);
         esp_mqtt_client_subscribe(s_mqtt, topic, 0);
-        ESP_LOGI(TAG, "MQTT connected, subscribed %s", topic);
+        snprintf(topic, sizeof(topic), "%s/ota", base_topic);
+        esp_mqtt_client_subscribe(s_mqtt, topic, 0);
+        ESP_LOGI(TAG, "MQTT connected, subscribed %s/{set,ota}", base_topic);
         mqtt_publish_state();
     } else if (event_id == MQTT_EVENT_DISCONNECTED) {
         s_mqtt_connected = false;
         ESP_LOGW(TAG, "MQTT disconnected");
     } else if (event_id == MQTT_EVENT_DATA) {
-        mqtt_apply_command(event->data, event->data_len);
+        /* route by topic suffix: .../ota -> firmware update, else config command */
+        if (event->topic && event->topic_len >= 4 &&
+            strncmp(event->topic + event->topic_len - 4, "/ota", 4) == 0) {
+            mqtt_ota_trigger(event->data, event->data_len);
+        } else {
+            mqtt_apply_command(event->data, event->data_len);
+        }
     }
 }
 
