@@ -29,3 +29,7 @@ zigbee2mqtt/ota_index.json
 *.swp
 Thumbs.db
 Desktop.ini
+
+# ...but DO track published firmware in ota/ (Zigbee .ota + raw .bin for WiFi OTA)
+!ota/*.ota
+!ota/*.bin
