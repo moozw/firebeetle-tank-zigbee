@@ -5,7 +5,7 @@
  *  - Barometric reference sensor (0x5C) measures ambient pressure.
  *  - depth = (P_tank - P_baro) / (rho * g)   -> reported in cm and %.
  *  - Relay on D13/GPIO15 (Adafruit Power Relay FeatherWing) drives the fill
- *    pump: ON when depth <= low setpoint, OFF when depth >= full setpoint.
+ *    pump: ON when depth <= operating setpoint, OFF when depth >= full setpoint.
  *  - Mains powered => Zigbee ROUTER (repeats the mesh for other devices).
  *  - Low/full setpoints, tank height, water density and an auto/on/off mode
  *    override are all writable live from Zigbee2MQTT.
@@ -33,6 +33,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_wifi.h"
+#include "mqtt_client.h"
 #include "esp_zigbee_core.h"
 
 #include "app_config.h"
@@ -46,40 +47,61 @@ typedef struct {
     uint8_t  version;
     uint8_t  calibrated;
     int16_t  low_cm;
+    int16_t  operating_cm;
     int16_t  full_cm;
     int16_t  tank_h_cm;
     uint16_t density;
     uint8_t  mode;          /* MODE_AUTO / MODE_ON / MODE_OFF */
     uint8_t  conn_mode;     /* CONN_* */
     int16_t  air_offset_hpa_x100;
+    char     wifi_ssid[33];
+    char     wifi_pass[65];
+    char     mqtt_host[65];
+    char     mqtt_user[33];
+    char     mqtt_pass[65];
+    char     mqtt_topic[33];
 } cfg_t;
 
 static cfg_t g_cfg = {
     .magic     = 0x544b,     /* "TK" */
-    .version   = 2,
+    .version   = 4,
     .calibrated = 0,
     .low_cm    = DEFAULT_LEVEL_LOW_CM,
+    .operating_cm = DEFAULT_OPERATING_CM,
     .full_cm   = DEFAULT_LEVEL_FULL_CM,
     .tank_h_cm = DEFAULT_TANK_HEIGHT_CM,
     .density   = DEFAULT_WATER_DENSITY,
     .mode      = MODE_AUTO,
-    .conn_mode = CONN_ZIGBEE,
+    .conn_mode = CONN_UNSET,
     .air_offset_hpa_x100 = 0,
+    .wifi_ssid = "",
+    .wifi_pass = "",
+    .mqtt_host = DEFAULT_MQTT_HOST,
+    .mqtt_user = "",
+    .mqtt_pass = "",
+    .mqtt_topic = DEFAULT_MQTT_TOPIC,
 };
 static SemaphoreHandle_t g_cfg_mtx;
 static void cfg_save(void);
 
 static const cfg_t DEFAULT_CFG = {
     .magic     = 0x544b,
-    .version   = 2,
+    .version   = 4,
     .calibrated = 0,
     .low_cm    = DEFAULT_LEVEL_LOW_CM,
+    .operating_cm = DEFAULT_OPERATING_CM,
     .full_cm   = DEFAULT_LEVEL_FULL_CM,
     .tank_h_cm = DEFAULT_TANK_HEIGHT_CM,
     .density   = DEFAULT_WATER_DENSITY,
     .mode      = MODE_AUTO,
-    .conn_mode = CONN_ZIGBEE,
+    .conn_mode = CONN_UNSET,
     .air_offset_hpa_x100 = 0,
+    .wifi_ssid = "",
+    .wifi_pass = "",
+    .mqtt_host = DEFAULT_MQTT_HOST,
+    .mqtt_user = "",
+    .mqtt_pass = "",
+    .mqtt_topic = DEFAULT_MQTT_TOPIC,
 };
 
 /* live telemetry (updated by control task) */
@@ -90,10 +112,17 @@ static int32_t g_baro_pressure_hpa_x100 = -1;
 static int32_t g_tank_pressure_hpa_x100 = -1;
 static uint8_t g_level_pct = 0;
 static uint8_t g_fault     = 0;
+static uint8_t g_low_alert = 0;
 static bool    g_relay_on  = false;
 static volatile bool g_zb_joined = false;   /* true once on a Zigbee network */
 static volatile int64_t g_join_us = 0;      /* timestamp (us) when we joined   */
 static volatile bool s_ota_active = false;  /* true while an OTA is downloading */
+static volatile bool s_wifi_connected = false;
+static esp_mqtt_client_handle_t s_mqtt = NULL;
+static volatile bool s_mqtt_connected = false;
+static char s_mqtt_uri[96];
+static httpd_handle_t s_httpd = NULL;
+static int s_wifi_retry = 0;
 
 /* ----------------------------- NVS persistence -------------------------- */
 static void cfg_load(void)
@@ -110,14 +139,22 @@ static void cfg_load(void)
         || g_cfg.version != DEFAULT_CFG.version
         || g_cfg.calibrated > 1
         || g_cfg.low_cm < 0
-        || g_cfg.full_cm <= g_cfg.low_cm
+        || g_cfg.operating_cm < 0
+        || g_cfg.operating_cm < g_cfg.low_cm
+        || g_cfg.full_cm <= g_cfg.operating_cm
         || g_cfg.tank_h_cm < 10
         || g_cfg.tank_h_cm > 1000
         || g_cfg.full_cm > g_cfg.tank_h_cm + MAX_DEPTH_OVER_TANK_CM
         || g_cfg.density < 900
         || g_cfg.density > 1100
         || g_cfg.mode > MODE_OFF
-        || g_cfg.conn_mode > CONN_BOTH;
+        || (g_cfg.conn_mode != CONN_UNSET && g_cfg.conn_mode > CONN_WIFI)
+        || g_cfg.wifi_ssid[sizeof(g_cfg.wifi_ssid) - 1] != '\0'
+        || g_cfg.wifi_pass[sizeof(g_cfg.wifi_pass) - 1] != '\0'
+        || g_cfg.mqtt_host[sizeof(g_cfg.mqtt_host) - 1] != '\0'
+        || g_cfg.mqtt_user[sizeof(g_cfg.mqtt_user) - 1] != '\0'
+        || g_cfg.mqtt_pass[sizeof(g_cfg.mqtt_pass) - 1] != '\0'
+        || g_cfg.mqtt_topic[sizeof(g_cfg.mqtt_topic) - 1] != '\0';
     if (bad) {
         ESP_LOGW(TAG, "stored config invalid, restoring defaults");
         g_cfg = DEFAULT_CFG;
@@ -132,6 +169,155 @@ static void cfg_save(void)
     nvs_set_blob(h, "cfg", &g_cfg, sizeof(g_cfg));
     nvs_commit(h);
     nvs_close(h);
+}
+
+static void copy_form_str(const char *form, const char *key, char *dst, size_t dst_len)
+{
+    char val[96];
+    if (dst_len == 0) return;
+    if (httpd_query_key_value(form, key, val, sizeof(val)) == ESP_OK) {
+        strlcpy(dst, val, dst_len);
+    }
+}
+
+static int form_int(const char *form, const char *key, int fallback)
+{
+    char val[16];
+    if (httpd_query_key_value(form, key, val, sizeof(val)) == ESP_OK) {
+        return atoi(val);
+    }
+    return fallback;
+}
+
+static void mqtt_publish_state(void)
+{
+    if (!s_mqtt || !s_mqtt_connected) return;
+
+    cfg_t cfg;
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg = g_cfg;
+    xSemaphoreGive(g_cfg_mtx);
+
+    char topic[64];
+    char payload[384];
+    snprintf(topic, sizeof(topic), "%s/state", cfg.mqtt_topic[0] ? cfg.mqtt_topic : DEFAULT_MQTT_TOPIC);
+    int n = snprintf(payload, sizeof(payload),
+        "{\"depth_cm\":%d,\"level_pct\":%u,\"fault\":%u,\"low_alert\":%u,"
+        "\"relay\":%s,\"mode\":%u,\"low_cm\":%d,\"operating_cm\":%d,\"full_cm\":%d,"
+        "\"baro_hpa\":%.2f,\"tank_hpa\":%.2f}",
+        g_depth_cm, g_level_pct, g_fault, g_low_alert, g_relay_on ? "true" : "false",
+        cfg.mode, cfg.low_cm, cfg.operating_cm, cfg.full_cm,
+        g_baro_pressure_hpa_x100 >= 0 ? (double)g_baro_pressure_hpa_x100 / 100.0 : -1.0,
+        g_tank_pressure_hpa_x100 >= 0 ? (double)g_tank_pressure_hpa_x100 / 100.0 : -1.0);
+    esp_mqtt_client_publish(s_mqtt, topic, payload, n, 0, 0);
+}
+
+static bool json_has(const char *json, const char *key, char *val, size_t val_len)
+{
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    char *p = strstr(json, pat);
+    if (!p) return false;
+    p = strchr(p, ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\"') p++;
+    size_t i = 0;
+    while (*p && *p != ',' && *p != '}' && *p != '\"' && i + 1 < val_len) {
+        val[i++] = *p++;
+    }
+    val[i] = '\0';
+    return i > 0;
+}
+
+static void mqtt_apply_command(const char *payload, int len)
+{
+    char json[256];
+    size_t n = len < (int)sizeof(json) - 1 ? (size_t)len : sizeof(json) - 1;
+    memcpy(json, payload, n);
+    json[n] = '\0';
+
+    cfg_t cfg;
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg = g_cfg;
+    xSemaphoreGive(g_cfg_mtx);
+
+    char val[24];
+    if (json_has(json, "mode", val, sizeof(val))) {
+        if (strcmp(val, "auto") == 0) cfg.mode = MODE_AUTO;
+        else if (strcmp(val, "force_on") == 0 || strcmp(val, "on") == 0) cfg.mode = MODE_ON;
+        else if (strcmp(val, "force_off") == 0 || strcmp(val, "off") == 0) cfg.mode = MODE_OFF;
+        else cfg.mode = (uint8_t)atoi(val);
+    }
+    if (json_has(json, "low_cm", val, sizeof(val))) cfg.low_cm = atoi(val);
+    if (json_has(json, "operating_cm", val, sizeof(val))) cfg.operating_cm = atoi(val);
+    if (json_has(json, "full_cm", val, sizeof(val))) cfg.full_cm = atoi(val);
+
+    if (cfg.low_cm < 0 || cfg.operating_cm < cfg.low_cm || cfg.full_cm <= cfg.operating_cm ||
+        cfg.mode > MODE_OFF) {
+        ESP_LOGW(TAG, "MQTT command rejected: %s", json);
+        return;
+    }
+
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    g_cfg.low_cm = cfg.low_cm;
+    g_cfg.operating_cm = cfg.operating_cm;
+    g_cfg.full_cm = cfg.full_cm;
+    g_cfg.mode = cfg.mode;
+    xSemaphoreGive(g_cfg_mtx);
+    cfg_save();
+    ESP_LOGI(TAG, "MQTT cfg: lowAlert=%d operating=%d full=%d mode=%u",
+             cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.mode);
+    mqtt_publish_state();
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    if (event_id == MQTT_EVENT_CONNECTED) {
+        s_mqtt_connected = true;
+        cfg_t cfg;
+        xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+        cfg = g_cfg;
+        xSemaphoreGive(g_cfg_mtx);
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%s/set", cfg.mqtt_topic[0] ? cfg.mqtt_topic : DEFAULT_MQTT_TOPIC);
+        esp_mqtt_client_subscribe(s_mqtt, topic, 0);
+        ESP_LOGI(TAG, "MQTT connected, subscribed %s", topic);
+        mqtt_publish_state();
+    } else if (event_id == MQTT_EVENT_DISCONNECTED) {
+        s_mqtt_connected = false;
+        ESP_LOGW(TAG, "MQTT disconnected");
+    } else if (event_id == MQTT_EVENT_DATA) {
+        mqtt_apply_command(event->data, event->data_len);
+    }
+}
+
+static void mqtt_start(void)
+{
+    cfg_t cfg;
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg = g_cfg;
+    xSemaphoreGive(g_cfg_mtx);
+    if (!cfg.mqtt_host[0]) {
+        ESP_LOGI(TAG, "MQTT disabled: no broker host configured");
+        return;
+    }
+
+    snprintf(s_mqtt_uri, sizeof(s_mqtt_uri), "mqtt://%s", cfg.mqtt_host);
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = s_mqtt_uri,
+        .credentials.username = cfg.mqtt_user[0] ? cfg.mqtt_user : NULL,
+        .credentials.authentication.password = cfg.mqtt_pass[0] ? cfg.mqtt_pass : NULL,
+    };
+    s_mqtt = esp_mqtt_client_init(&mqtt_cfg);
+    if (!s_mqtt) {
+        ESP_LOGE(TAG, "MQTT init failed");
+        return;
+    }
+    esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    ESP_ERROR_CHECK(esp_mqtt_client_start(s_mqtt));
+    ESP_LOGI(TAG, "MQTT starting: %s topic=%s", s_mqtt_uri, cfg.mqtt_topic);
 }
 
 /* ----------------------------- relay ------------------------------------ */
@@ -178,6 +364,8 @@ static void zb_push_telemetry(void)
     err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_FAULT, &g_fault, false);
     err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LOW_ALERT, &g_low_alert, false);
+    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_BARO_PRESSURE_HPA, &g_baro_pressure_hpa, false);
     err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TANK_PRESSURE_HPA, &g_tank_pressure_hpa, false);
@@ -220,17 +408,20 @@ static esp_err_t setup_status_get(httpd_req_t *req)
     cfg = g_cfg;
     xSemaphoreGive(g_cfg_mtx);
 
-    char json[640];
+    char json[980];
     int n = snprintf(json, sizeof(json),
         "{\"baro_hpa\":%.2f,\"tank_hpa\":%.2f,\"depth_cm\":%d,\"level_pct\":%u,"
-        "\"fault\":%u,\"relay\":%s,\"calibrated\":%u,\"air_offset_hpa\":%.2f,"
-        "\"low_cm\":%d,\"full_cm\":%d,\"tank_height_cm\":%d,\"density\":%u,"
-        "\"mode\":%u,\"conn_mode\":%u}",
+        "\"fault\":%u,\"low_alert\":%u,\"relay\":%s,\"calibrated\":%u,\"air_offset_hpa\":%.2f,"
+        "\"low_cm\":%d,\"operating_cm\":%d,\"full_cm\":%d,\"tank_height_cm\":%d,\"density\":%u,"
+        "\"mode\":%u,\"conn_mode\":%u,\"wifi_connected\":%s,\"mqtt_connected\":%s,"
+        "\"wifi_ssid\":\"%s\",\"mqtt_host\":\"%s\",\"mqtt_user\":\"%s\",\"mqtt_topic\":\"%s\"}",
         g_baro_pressure_hpa_x100 >= 0 ? (double)g_baro_pressure_hpa_x100 / 100.0 : -1.0,
         g_tank_pressure_hpa_x100 >= 0 ? (double)g_tank_pressure_hpa_x100 / 100.0 : -1.0,
-        g_depth_cm, g_level_pct, g_fault, g_relay_on ? "true" : "false",
+        g_depth_cm, g_level_pct, g_fault, g_low_alert, g_relay_on ? "true" : "false",
         cfg.calibrated, (double)cfg.air_offset_hpa_x100 / 100.0,
-        cfg.low_cm, cfg.full_cm, cfg.tank_h_cm, cfg.density, cfg.mode, cfg.conn_mode);
+        cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.tank_h_cm, cfg.density, cfg.mode, cfg.conn_mode,
+        s_wifi_connected ? "true" : "false", s_mqtt_connected ? "true" : "false",
+        cfg.wifi_ssid, cfg.mqtt_host, cfg.mqtt_user, cfg.mqtt_topic);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, json, n);
 }
@@ -243,28 +434,41 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "body{font-family:system-ui,Segoe UI,sans-serif;margin:0;background:#f5f7f8;color:#172026}"
         "main{max-width:760px;margin:auto;padding:18px}section{background:white;border:1px solid #d8e0e4;border-radius:8px;padding:14px;margin:12px 0}"
         "h1{font-size:24px;margin:4px 0 12px}h2{font-size:17px;margin:0 0 10px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}"
-        ".v{padding:10px;background:#eef3f5;border-radius:6px}label{display:block;font-size:13px;margin:10px 0 3px}input,select,button{font:inherit;padding:10px;border-radius:6px;border:1px solid #b8c4ca;box-sizing:border-box;width:100%}"
+        ".v{padding:10px;background:#eef3f5;border-radius:6px}label{display:block;font-size:13px;margin:10px 0 3px}input,select,button{font:inherit;padding:10px;border-radius:6px;border:1px solid #b8c4ca;box-sizing:border-box;width:100%;color:#172026;background:#fff}"
         "button{background:#0b6f85;color:white;border:0;margin-top:10px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.warn{color:#9a4b00}.ok{color:#157347}"
         "</style></head><body><main><h1>Tank Controller Setup</h1>"
         "<section><h2>Live Sensor Check</h2><div class=grid>"
         "<div class=v>Baro <b id=baro>-</b> hPa</div><div class=v>Tank <b id=tank>-</b> hPa</div>"
-        "<div class=v>Depth <b id=depth>-</b> cm</div><div class=v>Fault <b id=fault>-</b></div>"
+        "<div class=v>Depth <b id=depth>-</b> cm</div><div class=v>Low alert <b id=lowalert>-</b></div>"
+        "<div class=v>Relay <b id=relay>-</b></div><div class=v>Fault <b id=fault>-</b></div>"
+        "<div class=v>WiFi <b id=wifistat>-</b></div><div class=v>MQTT <b id=mqttstat>-</b></div>"
         "</div><p id=cal></p></section>"
         "<section><h2>1. Open-Air Test</h2><p>Keep both sensors in open air, then save the offset.</p><button onclick=\"post('/api/open_air')\">Run open-air test</button></section>"
         "<section><h2>2. Full Tank Calibration</h2><p>Lower the tank sensor into a full tank, keep the baro sensor in air, then save full.</p><button onclick=\"post('/api/full_tank')\">Set full tank</button></section>"
         "<section><h2>Operating Parameters</h2><div class=row>"
-        "<label>Low level cm<input id=low type=number></label><label>Full level cm<input id=full type=number></label>"
+        "<label>Low alert cm<input id=low type=number></label><label>Operating level cm<input id=op type=number></label>"
+        "<label>Full level cm<input id=full type=number></label>"
         "<label>Tank height cm<input id=height type=number></label><label>Density kg/m3<input id=density type=number></label>"
         "<label>Mode<select id=mode><option value=0>auto</option><option value=1>force on</option><option value=2>force off</option></select></label>"
-        "<label>Connectivity<select id=conn><option value=0>standalone</option><option value=1>zigbee</option><option value=2>wifi</option><option value=3>both</option></select></label>"
+        "<label>Connectivity<select id=conn><option value=255>choose</option><option value=0>AP</option><option value=1>zigbee</option><option value=2>local wifi</option></select></label>"
+        "</div></section><section><h2>Local WiFi / MQTT</h2><div class=row>"
+        "<label>WiFi SSID<input id=ssid></label><label>WiFi password<input id=wpass type=password autocomplete=off></label>"
+        "<label>MQTT broker IP/host<input id=mh placeholder='192.168.1.10'></label><label>MQTT topic<input id=mt></label>"
+        "<label>MQTT user<input id=mu></label><label>MQTT password<input id=mp type=password autocomplete=off></label>"
         "</div><button onclick=save()>Save parameters</button></section><p id=msg></p></main><script>"
+        "const $=id=>document.getElementById(id);"
+        "let editing=false;"
+        "function bindEdits(){['low','op','full','height','density','mode','conn','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>editing=true;$(id).onchange=()=>editing=true})}"
+        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank'}"
         "async function load(){let r=await fetch('/api/status');let s=await r.json();"
-        "baro.textContent=s.baro_hpa.toFixed(2);tank.textContent=s.tank_hpa.toFixed(2);depth.textContent=s.depth_cm;fault.textContent=s.fault;"
-        "cal.innerHTML=s.calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';"
-        "low.value=s.low_cm;full.value=s.full_cm;height.value=s.tank_height_cm;density.value=s.density;mode.value=s.mode;conn.value=s.conn_mode}"
-        "async function post(u){let r=await fetch(u,{method:'POST'});msg.textContent=await r.text();load()}"
-        "async function save(){let q=new URLSearchParams({low:low.value,full:full.value,height:height.value,density:density.value,mode:mode.value,conn:conn.value});let r=await fetch('/api/config?'+q,{method:'POST'});msg.textContent=await r.text();load()}"
-        "load();setInterval(load,3000)</script></body></html>";
+        "$('baro').textContent=s.baro_hpa.toFixed(2);$('tank').textContent=s.tank_hpa.toFixed(2);$('depth').textContent=s.depth_cm;$('fault').textContent=s.fault;"
+        "$('lowalert').textContent=s.low_alert?'ON':'OFF';$('relay').textContent=s.relay?'ON':'OFF';"
+        "$('wifistat').textContent=s.wifi_connected?'connected':'off';$('mqttstat').textContent=s.mqtt_connected?'connected':'off';"
+        "$('cal').innerHTML=s.calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';"
+        "if(!editing)syncForm(s)}"
+        "async function post(u){let r=await fetch(u,{method:'POST'});$('msg').textContent=await r.text();editing=false;load()}"
+        "async function save(){let q=new URLSearchParams({low:$('low').value,op:$('op').value,full:$('full').value,height:$('height').value,density:$('density').value,mode:$('mode').value,conn:$('conn').value,ssid:$('ssid').value,wpass:$('wpass').value,mh:$('mh').value,mu:$('mu').value,mp:$('mp').value,mt:$('mt').value});let r=await fetch('/api/config',{method:'POST',body:q});$('msg').textContent=await r.text();if(r.ok){editing=false;$('wpass').value='';$('mp').value=''}load()}"
+        "bindEdits();load();setInterval(load,3000)</script></body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
@@ -309,20 +513,12 @@ static esp_err_t setup_full_tank_post(httpd_req_t *req)
     g_cfg.full_cm = full_cm;
     g_cfg.low_cm = full_cm * 30 / 100;
     if (g_cfg.low_cm < 1) g_cfg.low_cm = 1;
+    g_cfg.operating_cm = full_cm * 40 / 100;
+    if (g_cfg.operating_cm <= g_cfg.low_cm) g_cfg.operating_cm = g_cfg.low_cm + 1;
     g_cfg.calibrated = 1;
     xSemaphoreGive(g_cfg_mtx);
     cfg_save();
     return httpd_resp_sendstr(req, "Full-tank calibration saved. Standalone AUTO control can now use the saved limits.");
-}
-
-static int query_int(httpd_req_t *req, const char *key, int fallback)
-{
-    char query[192], val[16];
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, key, val, sizeof(val)) == ESP_OK) {
-        return atoi(val);
-    }
-    return fallback;
 }
 
 static esp_err_t setup_config_post(httpd_req_t *req)
@@ -331,16 +527,41 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     cfg_t cfg = g_cfg;
     xSemaphoreGive(g_cfg_mtx);
 
-    cfg.low_cm = query_int(req, "low", cfg.low_cm);
-    cfg.full_cm = query_int(req, "full", cfg.full_cm);
-    cfg.tank_h_cm = query_int(req, "height", cfg.tank_h_cm);
-    cfg.density = query_int(req, "density", cfg.density);
-    cfg.mode = query_int(req, "mode", cfg.mode);
-    cfg.conn_mode = query_int(req, "conn", cfg.conn_mode);
+    char form[900] = "";
+    if (req->content_len > 0) {
+        int got = httpd_req_recv(req, form, sizeof(form) - 1);
+        if (got <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing form body");
+        form[got] = '\0';
+    } else if (httpd_req_get_url_query_str(req, form, sizeof(form)) != ESP_OK) {
+        form[0] = '\0';
+    }
 
-    if (cfg.low_cm < 0 || cfg.full_cm <= cfg.low_cm || cfg.tank_h_cm < 10 ||
+    cfg.low_cm = form_int(form, "low", cfg.low_cm);
+    cfg.operating_cm = form_int(form, "op", cfg.operating_cm);
+    cfg.full_cm = form_int(form, "full", cfg.full_cm);
+    cfg.tank_h_cm = form_int(form, "height", cfg.tank_h_cm);
+    cfg.density = form_int(form, "density", cfg.density);
+    cfg.mode = form_int(form, "mode", cfg.mode);
+    cfg.conn_mode = form_int(form, "conn", cfg.conn_mode);
+    copy_form_str(form, "ssid", cfg.wifi_ssid, sizeof(cfg.wifi_ssid));
+    copy_form_str(form, "mh", cfg.mqtt_host, sizeof(cfg.mqtt_host));
+    copy_form_str(form, "mu", cfg.mqtt_user, sizeof(cfg.mqtt_user));
+    copy_form_str(form, "mt", cfg.mqtt_topic, sizeof(cfg.mqtt_topic));
+    char maybe_pass[65] = "";
+    copy_form_str(form, "wpass", maybe_pass, sizeof(maybe_pass));
+    if (maybe_pass[0]) strlcpy(cfg.wifi_pass, maybe_pass, sizeof(cfg.wifi_pass));
+    maybe_pass[0] = '\0';
+    copy_form_str(form, "mp", maybe_pass, sizeof(maybe_pass));
+    if (maybe_pass[0]) strlcpy(cfg.mqtt_pass, maybe_pass, sizeof(cfg.mqtt_pass));
+    if (!cfg.mqtt_topic[0]) strlcpy(cfg.mqtt_topic, DEFAULT_MQTT_TOPIC, sizeof(cfg.mqtt_topic));
+
+    if (cfg.low_cm < 0 || cfg.operating_cm < 0 || cfg.operating_cm < cfg.low_cm ||
+        cfg.full_cm <= cfg.operating_cm ||
+        cfg.tank_h_cm < 10 ||
         cfg.full_cm > cfg.tank_h_cm + MAX_DEPTH_OVER_TANK_CM || cfg.density < 900 ||
-        cfg.density > 1100 || cfg.mode > MODE_OFF || cfg.conn_mode > CONN_BOTH) {
+        cfg.density > 1100 || cfg.mode > MODE_OFF ||
+        (cfg.conn_mode != CONN_UNSET && cfg.conn_mode > CONN_WIFI) ||
+        (cfg.conn_mode == CONN_WIFI && !cfg.wifi_ssid[0])) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid parameter range");
     }
 
@@ -349,13 +570,29 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     xSemaphoreGive(g_cfg_mtx);
     cfg_save();
     zb_push_mode(cfg.mode);
+    ESP_LOGI(TAG, "setup save: lowAlert=%d operating=%d full=%d conn=%u mode=%u",
+             cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.conn_mode, cfg.mode);
     return httpd_resp_sendstr(req, "Parameters saved");
+}
+
+static void web_server_start(void)
+{
+    if (s_httpd) return;
+    httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
+    http_cfg.lru_purge_enable = true;
+    ESP_ERROR_CHECK(httpd_start(&s_httpd, &http_cfg));
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/", .method=HTTP_GET, .handler=setup_root_get });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/status", .method=HTTP_GET, .handler=setup_status_get });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/open_air", .method=HTTP_POST, .handler=setup_open_air_post });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/full_tank", .method=HTTP_POST, .handler=setup_full_tank_post });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/config", .method=HTTP_POST, .handler=setup_config_post });
 }
 
 static void setup_portal_start(void)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    esp_err_t err = esp_event_loop_create_default();
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(err);
+    err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(err);
     esp_netif_create_default_wifi_ap();
 
@@ -375,17 +612,110 @@ static void setup_portal_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    httpd_handle_t server = NULL;
-    httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
-    http_cfg.lru_purge_enable = true;
-    ESP_ERROR_CHECK(httpd_start(&server, &http_cfg));
-    httpd_register_uri_handler(server, &(httpd_uri_t){ .uri="/", .method=HTTP_GET, .handler=setup_root_get });
-    httpd_register_uri_handler(server, &(httpd_uri_t){ .uri="/api/status", .method=HTTP_GET, .handler=setup_status_get });
-    httpd_register_uri_handler(server, &(httpd_uri_t){ .uri="/api/open_air", .method=HTTP_POST, .handler=setup_open_air_post });
-    httpd_register_uri_handler(server, &(httpd_uri_t){ .uri="/api/full_tank", .method=HTTP_POST, .handler=setup_full_tank_post });
-    httpd_register_uri_handler(server, &(httpd_uri_t){ .uri="/api/config", .method=HTTP_POST, .handler=setup_config_post });
+    web_server_start();
 
     ESP_LOGI(TAG, "setup AP started: SSID=%s URL=http://192.168.4.1", ap_cfg.ap.ssid);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifi_connected = false;
+        if (s_wifi_retry++ < WIFI_MAX_RETRY) {
+            ESP_LOGW(TAG, "WiFi disconnected, retry %d/%d", s_wifi_retry, WIFI_MAX_RETRY);
+            esp_wifi_connect();
+        } else {
+            ESP_LOGE(TAG, "WiFi connect failed");
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        s_wifi_retry = 0;
+        s_wifi_connected = true;
+        ESP_LOGI(TAG, "WiFi connected: http://" IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+static bool wifi_station_start(void)
+{
+    cfg_t cfg;
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg = g_cfg;
+    xSemaphoreGive(g_cfg_mtx);
+    if (!cfg.wifi_ssid[0]) {
+        ESP_LOGE(TAG, "WiFi mode selected but no SSID is configured");
+        return false;
+    }
+
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(err);
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(err);
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char *)sta_cfg.sta.ssid, cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char *)sta_cfg.sta.password, cfg.wifi_pass, sizeof(sta_cfg.sta.password));
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    if (!cfg.wifi_pass[0]) sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+
+    s_wifi_retry = 0;
+    s_wifi_connected = false;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "WiFi connecting to SSID=%s", cfg.wifi_ssid);
+
+    int64_t deadline = esp_timer_get_time() + (int64_t)WIFI_CONNECT_TIMEOUT_MS * 1000;
+    while (!s_wifi_connected && esp_timer_get_time() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!s_wifi_connected) {
+        ESP_LOGE(TAG, "WiFi connection timed out; falling back to setup AP");
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        return false;
+    }
+
+    web_server_start();
+    mqtt_start();
+    return true;
+}
+
+static bool setup_boot_button_held(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+
+    int64_t deadline = esp_timer_get_time() + (int64_t)SETUP_BOOT_WINDOW_MS * 1000;
+    int64_t down_since = 0;
+    while (esp_timer_get_time() < deadline) {
+        bool down = gpio_get_level(BUTTON_GPIO) == 0;
+        if (down) {
+            if (down_since == 0) {
+                down_since = esp_timer_get_time();
+            } else if (esp_timer_get_time() - down_since >= (int64_t)SETUP_BOOT_HOLD_MS * 1000) {
+                ESP_LOGW(TAG, "BOOT held during startup -> setup AP mode");
+                return true;
+            }
+        } else {
+            down_since = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return false;
 }
 #endif
 
@@ -526,6 +856,7 @@ static void control_task(void *arg)
                 g_fault = 0;
                 level_ok = true;
             }
+            g_low_alert = (level_ok && g_depth_cm <= cfg.low_cm) ? 1 : 0;
             fault_count = 0;
 #if LOG_SENSOR_READINGS
             ESP_LOGI(TAG, "sensor read: baro=%.2fhPa(%d/%d) tank=%.2fhPa(%d/%d) depth=%dcm level=%u%% fault=%u",
@@ -541,6 +872,7 @@ static void control_task(void *arg)
             g_depth_cm = (int16_t)lroundf(baro_rd ? p_baro : p_tank);
             g_level_pct = 0;
             g_fault = 2;            /* 2 = single-sensor diagnostic mode */
+            g_low_alert = 0;
             fault_count = 0;
 #if LOG_SENSOR_READINGS
             ESP_LOGW(TAG, "sensor read: only %s OK, pressure=%.2fhPa",
@@ -548,6 +880,7 @@ static void control_task(void *arg)
 #endif
         } else {
             if (++fault_count >= SENSOR_FAULT_LIMIT) g_fault = 1;
+            g_low_alert = 0;
 #if LOG_SENSOR_READINGS
             ESP_LOGW(TAG, "sensor read failed: baro=%s tank=%s fault_count=%d",
                      baro_ok ? "no-data" : "absent",
@@ -564,7 +897,7 @@ static void control_task(void *arg)
         } else if (cfg.mode == MODE_OFF) {
             want = false;
         } else if (level_ok) {                  /* AUTO with a real water level */
-            if (g_depth_cm <= cfg.low_cm)  want = true;   /* low  -> fill  */
+            if (g_depth_cm <= cfg.operating_cm) want = true;   /* operating -> fill */
             if (g_depth_cm >= cfg.full_cm) want = false;  /* full -> stop  */
         } else {                                /* AUTO, no full level available */
 #if DIAG_RELAY_SENSOR_INDICATOR
@@ -592,6 +925,7 @@ static void control_task(void *arg)
         }
 
         zb_push_telemetry();
+        mqtt_publish_state();
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }
@@ -705,14 +1039,15 @@ static esp_err_t zb_set_attr_cb(const esp_zb_zcl_set_attr_value_message_t *m)
         case ATTR_TANK_HEIGHT_CM: g_cfg.tank_h_cm = *(int16_t *)m->attribute.data.value; break;
         case ATTR_DENSITY:        g_cfg.density   = *(uint16_t *)m->attribute.data.value; break;
         case ATTR_MODE:           g_cfg.mode      = *(uint8_t *)m->attribute.data.value; break;
+        case ATTR_OPERATING_CM:   g_cfg.operating_cm = *(int16_t *)m->attribute.data.value; break;
         default: break;
     }
     cfg_t snap = g_cfg;
     xSemaphoreGive(g_cfg_mtx);
 
     cfg_save();
-    ESP_LOGI(TAG, "cfg update: low=%d full=%d tankH=%d rho=%d mode=%d",
-             snap.low_cm, snap.full_cm, snap.tank_h_cm, snap.density, snap.mode);
+    ESP_LOGI(TAG, "cfg update: lowAlert=%d operating=%d full=%d tankH=%d rho=%d mode=%d",
+             snap.low_cm, snap.operating_cm, snap.full_cm, snap.tank_h_cm, snap.density, snap.mode);
     return ESP_OK;
 }
 
@@ -752,6 +1087,8 @@ static void add_custom_cluster(esp_zb_cluster_list_t *list)
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &s16);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_TANK_PRESSURE_HPA, ESP_ZB_ZCL_ATTR_TYPE_S16,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &s16);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_LOW_ALERT, ESP_ZB_ZCL_ATTR_TYPE_U8,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &u8);
 
     /* config: read/write */
     s16 = g_cfg.low_cm;
@@ -768,6 +1105,9 @@ static void add_custom_cluster(esp_zb_cluster_list_t *list)
     u8 = g_cfg.mode;
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_MODE, ESP_ZB_ZCL_ATTR_TYPE_U8,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &u8);
+    s16 = g_cfg.operating_cm;
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_OPERATING_CM, ESP_ZB_ZCL_ATTR_TYPE_S16,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &s16);
 
     esp_zb_cluster_list_add_custom_cluster(list, c, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 }
@@ -857,6 +1197,11 @@ static void esp_zb_task(void *arg)
     esp_zb_stack_main_loop();
 }
 
+static void zb_commissioning_alarm_cb(uint8_t mode)
+{
+    esp_zb_bdb_start_top_level_commissioning(mode);
+}
+
 /* signal handler: drives commissioning / network steering */
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
 {
@@ -882,8 +1227,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
             }
         } else {
             ESP_LOGW(TAG, "init failed (%s), retrying", esp_err_to_name(err));
-            esp_zb_scheduler_alarm((esp_zb_callback_t)esp_zb_bdb_start_top_level_commissioning,
-                                   ESP_ZB_BDB_MODE_INITIALIZATION, 1000);
+            esp_zb_scheduler_alarm(zb_commissioning_alarm_cb, ESP_ZB_BDB_MODE_INITIALIZATION, 1000);
         }
         break;
     case ESP_ZB_BDB_SIGNAL_STEERING:
@@ -896,8 +1240,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
                      esp_zb_get_current_channel());
         } else {
             ESP_LOGW(TAG, "no network found, retrying steering");
-            esp_zb_scheduler_alarm((esp_zb_callback_t)esp_zb_bdb_start_top_level_commissioning,
-                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+            esp_zb_scheduler_alarm(zb_commissioning_alarm_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
         }
         break;
     default:
@@ -915,17 +1258,37 @@ void app_main(void)
     cfg_load();
     relay_init();                       /* relay OFF before anything else */
 
+    bool setup_mode = false;
+    bool wifi_mode = false;
 #if SETUP_PORTAL_ENABLE
-    setup_portal_start();
+    setup_mode = (g_cfg.conn_mode == CONN_UNSET) || (g_cfg.conn_mode == CONN_AP) || setup_boot_button_held();
+    if (setup_mode) {
+        setup_portal_start();
+    }
 #endif
 
-    esp_zb_platform_config_t platform = {
-        .radio_config = { .radio_mode = ZB_RADIO_MODE_NATIVE },
-        .host_config  = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },
-    };
-    ESP_ERROR_CHECK(esp_zb_platform_config(&platform));
+    bool start_zigbee = !setup_mode && (g_cfg.conn_mode == CONN_ZIGBEE);
+    if (!setup_mode && g_cfg.conn_mode == CONN_WIFI) {
+        wifi_mode = wifi_station_start();
+        if (!wifi_mode) {
+            setup_mode = true;
+#if SETUP_PORTAL_ENABLE
+            setup_portal_start();
+#endif
+        }
+    }
+
+    if (start_zigbee) {
+        esp_zb_platform_config_t platform = {
+            .radio_config = { .radio_mode = ZB_RADIO_MODE_NATIVE },
+            .host_config  = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },
+        };
+        ESP_ERROR_CHECK(esp_zb_platform_config(&platform));
+    }
 
     xTaskCreate(control_task, "control", 4096, NULL, 5, NULL);
-    xTaskCreate(button_task, "button", 3072, NULL, 4, NULL);
-    xTaskCreate(esp_zb_task, "zigbee", 8192, NULL, 6, NULL);
+    if (start_zigbee) {
+        xTaskCreate(button_task, "button", 3072, NULL, 4, NULL);
+        xTaskCreate(esp_zb_task, "zigbee", 8192, NULL, 6, NULL);
+    }
 }

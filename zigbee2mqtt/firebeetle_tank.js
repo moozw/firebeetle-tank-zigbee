@@ -7,8 +7,10 @@
 // Custom cluster 0xFC11 (51217) attribute IDs:
 //   0x00 depth(cm,s16 RO)  0x01 level(%,u8 RO)  0x02 fault(u8 RO)
 //   0x03 baro_pressure(hPa,s16 RO)  0x04 tank_pressure(hPa,s16 RO)
+//   0x05 low_alert(u8 RO)
 //   0x10 level_low(cm,s16) 0x11 level_full(cm,s16) 0x12 tank_height(cm,s16)
 //   0x13 density(kg/m3,u16) 0x14 mode(u8: 0 auto/1 force_on/2 force_off)
+//   0x15 operating_level(cm,s16)
 
 const fz = require('zigbee-herdsman-converters/converters/fromZigbee');
 const tz = require('zigbee-herdsman-converters/converters/toZigbee');
@@ -42,16 +44,19 @@ const fzTank = {
         const fault = firstDefined(d, ['2', 'attr2']);
         const baroPressure = firstDefined(d, ['3', 'attr3']);
         const tankPressure = firstDefined(d, ['4', 'attr4']);
+        const lowAlert = firstDefined(d, ['5', 'attr5']);
         if (depth     !== undefined) r.depth       = depth;
         if (level     !== undefined) r.level       = level;
         if (fault     !== undefined) r.fault       = fault ? 'ON' : 'OFF';
         if (baroPressure !== undefined) r.baro_pressure = baroPressure;
         if (tankPressure !== undefined) r.tank_pressure = tankPressure;
+        if (lowAlert !== undefined) r.low_alert = lowAlert ? 'ON' : 'OFF';
         if (d['16'] !== undefined) r.level_low    = d['16'];
         if (d['17'] !== undefined) r.level_full   = d['17'];
         if (d['18'] !== undefined) r.tank_height  = d['18'];
         if (d['19'] !== undefined) r.density       = d['19'];
         if (d['20'] !== undefined) r.mode          = MODE_MAP[d['20']];
+        if (d['21'] !== undefined) r.operating_level = d['21'];
         return r;
     },
 };
@@ -70,11 +75,12 @@ const fzPressure = {
 
 // settable config attributes
 const tzTank = {
-    key: ['level_low', 'level_full', 'tank_height', 'density', 'mode'],
+    key: ['level_low', 'operating_level', 'level_full', 'tank_height', 'density', 'mode'],
     convertSet: async (entity, key, value, meta) => {
         const W = {
             level_low:   [0x10, S16], level_full:  [0x11, S16],
             tank_height: [0x12, S16], density:     [0x13, U16], mode: [0x14, U8],
+            operating_level: [0x15, S16],
         };
         const [attr, type] = W[key];
         const raw = key === 'mode' ? MODE_REV[value] : value;
@@ -82,14 +88,14 @@ const tzTank = {
         return {state: {[key]: value}};
     },
     convertGet: async (entity, key, meta) => {
-        const R = {level_low: 0x10, level_full: 0x11, tank_height: 0x12, density: 0x13, mode: 0x14};
+        const R = {level_low: 0x10, level_full: 0x11, tank_height: 0x12, density: 0x13, mode: 0x14, operating_level: 0x15};
         await entity.read(CLUSTER, [R[key]], {manufacturerCode: MANUFACTURER_CODE});
     },
 };
 
 // read-only telemetry (refresh button reads it on demand)
 const tzTankRead = {
-    key: ['depth', 'level', 'fault', 'baro_pressure', 'tank_pressure'],
+    key: ['depth', 'level', 'fault', 'low_alert', 'baro_pressure', 'tank_pressure'],
     convertGet: async (entity, key, meta) => {
         if (key === 'baro_pressure') {
             await entity.read(PRESSURE_CLUSTER, [0x0000]);
@@ -99,7 +105,7 @@ const tzTankRead = {
             await entity.read(PRESSURE_CLUSTER, [0x0010]);
             return;
         }
-        const R = {depth: 0x00, level: 0x01, fault: 0x02, baro_pressure: 0x03, tank_pressure: 0x04};
+        const R = {depth: 0x00, level: 0x01, fault: 0x02, baro_pressure: 0x03, tank_pressure: 0x04, low_alert: 0x05};
         await entity.read(CLUSTER, [R[key]], {manufacturerCode: MANUFACTURER_CODE});
     },
 };
@@ -133,6 +139,7 @@ module.exports = [
                     {attribute: {ID: 0x02, type: U8},  minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
                     {attribute: {ID: 0x03, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
                     {attribute: {ID: 0x04, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
+                    {attribute: {ID: 0x05, type: U8},  minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
                 ], {manufacturerCode: MANUFACTURER_CODE});
             } catch (e) {}
         },
@@ -141,11 +148,14 @@ module.exports = [
             e.numeric('depth', ea.STATE_GET).withUnit('cm').withDescription('Water depth above sensor'),
             e.numeric('level', ea.STATE_GET).withUnit('%').withDescription('Tank level'),
             e.binary('fault', ea.STATE_GET, 'ON', 'OFF').withDescription('Sensor fault (pump forced off)'),
+            e.binary('low_alert', ea.STATE_GET, 'ON', 'OFF').withDescription('Low level alert'),
             e.numeric('baro_pressure', ea.STATE_GET).withUnit('hPa')
                 .withDescription('Barometric reference pressure'),
             e.numeric('tank_pressure', ea.STATE_GET).withUnit('hPa')
                 .withDescription('Tank sensor absolute pressure'),
             e.numeric('level_low', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
+                .withDescription('Low-level alert point'),
+            e.numeric('operating_level', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
                 .withDescription('Pump turns ON at/below this depth'),
             e.numeric('level_full', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
                 .withDescription('Pump turns OFF at/above this depth'),

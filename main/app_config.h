@@ -2,7 +2,7 @@
  * app_config.h  -  All user-tunable constants in one place.
  *
  * Anything that depends on YOUR physical install lives here. The Zigbee
- * setpoints (low/full level) are NOT here - those are set live from
+ * setpoints (low alert / operating / full level) are NOT here - those are set live from
  * Zigbee2MQTT. These are the build-time defaults and the things that
  * can only be known by measuring your tank.
  */
@@ -20,6 +20,8 @@
 #define BUTTON_GPIO         28     /* onboard BOOT button, active-low (idle HIGH) */
 #define BUTTON_DEBOUNCE_MS  40
 #define BUTTON_LONGPRESS_MS 5000   /* >= this = Zigbee factory reset            */
+#define SETUP_BOOT_HOLD_MS  1500   /* hold BOOT during reset to start setup AP  */
+#define SETUP_BOOT_WINDOW_MS 5000  /* post-reset window to catch setup hold     */
 
 /* ---------- I2C addresses ---------- */
 /* Both Adafruit LPS2x boards power up on the same address. Current swapped
@@ -35,8 +37,9 @@
 
 /* ---------- Default level setpoints (cm of water above sensor) ---------- */
 /* These are just power-on defaults; change them live from Zigbee2MQTT.       */
-#define DEFAULT_LEVEL_LOW_CM    20     /* relay (pump) turns ON  at/below this  */
-#define DEFAULT_LEVEL_FULL_CM   80     /* relay (pump) turns OFF at/above this  */
+#define DEFAULT_LEVEL_LOW_CM    20     /* alert only at/below this depth       */
+#define DEFAULT_OPERATING_CM    30     /* relay (pump) turns ON at/below this  */
+#define DEFAULT_LEVEL_FULL_CM   80     /* relay (pump) turns OFF at/above this */
 #define DEFAULT_TANK_HEIGHT_CM  250    /* used to compute level % and sanity checks */
 
 /* ---------- Timing / safety ---------- */
@@ -67,6 +70,13 @@
 #define SETUP_AP_CHANNEL        6
 #define SETUP_AP_MAX_CONN       2
 
+/* ---------- Local WiFi / MQTT ---------- */
+#define WIFI_CONNECT_TIMEOUT_MS 15000
+#define WIFI_MAX_RETRY          5
+#define DEFAULT_MQTT_HOST       ""
+#define DEFAULT_MQTT_TOPIC      "tank/controller"
+#define MQTT_PUBLISH_PERIOD_MS  10000
+
 /* ---------- Zigbee ---------- */
 #define ZB_ENDPOINT             10
 #define ZB_PRIMARY_CHANNEL_MASK (1l << 15)   /* try ch 15 first; full mask also set */
@@ -79,23 +89,25 @@
 #define ATTR_FAULT              0x0002  /* u8,  0=ok 1=sensor fault   */
 #define ATTR_BARO_PRESSURE_HPA  0x0003  /* s16, read-only, reported   */
 #define ATTR_TANK_PRESSURE_HPA  0x0004  /* s16, read-only, reported   */
+#define ATTR_LOW_ALERT          0x0005  /* u8,  read-only, reported   */
 #define ATTR_SET_LOW_CM         0x0010  /* s16, read/write            */
 #define ATTR_SET_FULL_CM        0x0011  /* s16, read/write            */
 #define ATTR_TANK_HEIGHT_CM     0x0012  /* s16, read/write            */
 #define ATTR_DENSITY            0x0013  /* u16, read/write (kg/m^3)   */
 #define ATTR_MODE               0x0014  /* u8: 0=auto 1=force-on 2=force-off */
+#define ATTR_OPERATING_CM       0x0015  /* s16, read/write            */
 
 /* control modes */
 #define MODE_AUTO   0
 #define MODE_ON     1
 #define MODE_OFF    2
 
-/* connectivity preference saved by setup UI; current firmware still starts
- * Zigbee and setup AP, but this records the intended operating mode. */
-#define CONN_STANDALONE 0
+/* connectivity preference saved by setup UI. A fresh/unset unit starts the
+ * setup AP; after a choice is saved, normal boots follow that mode. */
+#define CONN_AP         0
 #define CONN_ZIGBEE     1
 #define CONN_WIFI       2
-#define CONN_BOTH       3
+#define CONN_UNSET      255
 
 /* ---------- OTA (wireless firmware update over Zigbee) ---------- */
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then

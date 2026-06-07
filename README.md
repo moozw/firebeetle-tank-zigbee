@@ -2,8 +2,9 @@
 
 Mains-powered Zigbee **router** that reads water depth from a submerged
 Adafruit **LPS35** (referenced against an Adafruit **LPS22** barometer) and
-drives a fill pump via an Adafruit **Power Relay FeatherWing**. The pump turns
-**ON at a low level** and **OFF at a full level**, both set live over Zigbee.
+drives a fill pump via an Adafruit **Power Relay FeatherWing**. The low level is
+an alert point; the pump turns **ON at the operating level** and **OFF at a full
+level**, all set live over Zigbee or the setup AP.
 
 ## How the level is measured
 
@@ -38,9 +39,10 @@ I²C addresses (7-bit):
 
 ```
 mode = AUTO:
-    depth ≤ level_low   → pump ON   (start filling)
-    depth ≥ level_full  → pump OFF  (tank full)
-    in between          → hold (hysteresis = the gap between low and full)
+    depth ≤ level_low        → low alert only
+    depth ≤ operating_level  → pump ON   (start filling)
+    depth ≥ level_full       → pump OFF  (tank full)
+    in between               → hold (hysteresis = the gap between operating and full)
 mode = FORCE_ON / FORCE_OFF → manual override
 fault (5 bad sensor reads) or boot → pump OFF (failsafe)
 anti-short-cycle: min 30 s rest before the pump can restart (AUTO only)
@@ -77,11 +79,34 @@ managed components automatically (see `main/idf_component.yml`).
    `data/external_converters/` folder and restart Z2M.
 2. Enable "permit join", power the device — it advertises as **DIY / ESP32C5**.
 3. In the device page you'll get: `state` (pump), `depth`, `level`, `fault`,
-   `baro_pressure`, `tank_pressure`, and settable `level_low`, `level_full`,
-   `tank_height`, `density`, `mode`.
+   `low_alert`, `baro_pressure`, `tank_pressure`, and settable `level_low`,
+   `operating_level`, `level_full`, `tank_height`, `density`, `mode`.
 
 To re-commission later, erase and re-flash, or send it through a factory reset
 (clear via `idf.py erase-flash`).
+
+## Local WiFi / MQTT mode
+
+From the setup AP, choose **local wifi**, enter the WiFi SSID/password, and
+optionally enter an MQTT broker host/IP, user, password, and base topic. On the
+next boot the device joins WiFi, serves the same setup/control page on its LAN
+IP, and publishes MQTT state to:
+
+```
+tank/controller/state
+```
+
+It subscribes for simple JSON config commands on:
+
+```
+tank/controller/set
+```
+
+Example command:
+
+```json
+{"mode":"auto","operating_cm":30,"full_cm":80}
+```
 
 ## Tunable defaults — `main/app_config.h`
 
