@@ -119,28 +119,64 @@ The current checked-in defaults are conservative bench defaults. In particular,
 sensors read close together in air. Set it to `0` before using the relay to
 drive an actual pump with one sensor submerged.
 
-## Zigbee OTA
+## Firmware updates (OTA)
 
-The firmware includes a Zigbee OTA client. For each OTA release:
+Two OTA paths, both served from **GitHub Releases** (binaries are *not* committed
+to the repo — only the small `ota/index.json` is tracked):
+
+- **Zigbee OTA** (device on Zigbee) — Zigbee2MQTT reads `ota/index.json` over
+  GitHub raw and downloads the `.ota` release asset.
+- **WiFi OTA** (device in WiFi/MQTT mode) — publish the `.bin` release URL to the
+  device's `<topic>/ota`; it downloads over HTTPS (`esp_https_ota`) and reboots.
+
+Both reuse the `ota_0`/`ota_1` slots (4 MB flash, dual-OTA partition table).
+
+### Cutting a release (one command)
+
+Bump `OTA_FW_VERSION` in `main/app_config.h`, then:
+
+```powershell
+pwsh tools/publish_release.ps1
+```
+
+It builds, packages the `.ota`, creates a GitHub Release with the `.ota` (Zigbee)
+and `.bin` (WiFi), repoints `ota/index.json` at the release, and commits/pushes
+the index. Auto-derives the tag (`v1.0.<low byte>`); override with `-Tag` /
+`-Notes`. Manual equivalent:
 
 ```powershell
 idf.py build
-python tools/make_ota.py build/firebeetle_tank_zigbee.bin tank2_v1.0.6.ota --version 0x01000006
+python tools/make_ota.py build/firebeetle_tank_zigbee.bin tank2_<tag>.ota --version <OTA_FW_VERSION>
+gh release create <tag> tank2_<tag>.ota build/firebeetle_tank_zigbee.bin
+# then edit ota/index.json (version/size/sha512/release URL) and push
 ```
 
-The `--version` value must match `OTA_FW_VERSION` in `main/app_config.h` and be
-higher than the version already running on the device. Put the generated `.ota`
-file on the Zigbee2MQTT host and add the printed metadata to the Z2M OTA
-override index.
+`--version` must equal `OTA_FW_VERSION` and be higher than what the device runs.
+
+### Triggering an update
+
+- **Zigbee** — in Z2M, open the device → **Check for new updates** → **Update**.
+  Z2M's `ota.zigbee_ota_override_index_location` must point at
+  `https://raw.githubusercontent.com/<owner>/<repo>/main/ota/index.json`.
+- **WiFi** — publish the release `.bin` URL; status comes back on
+  `tank/controller/ota_status`:
+
+```bash
+mosquitto_pub -h <broker> -t tank/controller/ota \
+  -m '{"url":"https://github.com/<owner>/<repo>/releases/download/<tag>/tank2_<tag>.bin"}'
+```
 
 ## Files
 
 ```
-CMakeLists.txt              project
-sdkconfig.defaults          Zigbee router + 802.15.4 + partition table
-partitions.csv              includes zb_storage / zb_fct for the Zigbee stack
-main/app_config.h           ← all the knobs
-main/lps2x.[ch]             LPS22/LPS35 I²C driver (one-shot reads)
-main/main.c                 control loop + Zigbee model
-zigbee2mqtt/firebeetle_tank.js   Z2M external converter
+CMakeLists.txt                   project
+sdkconfig.defaults               Zigbee + WiFi coex, 4 MB flash, OTA, TLS cert bundle
+partitions.csv                   4 MB dual-OTA layout (ota_0/ota_1/otadata + zb storage)
+main/app_config.h                ← all the knobs (incl. OTA_FW_VERSION)
+main/lps2x.[ch]                  LPS22/LPS35 I²C driver (one-shot reads)
+main/main.c                      control loop + Zigbee + WiFi/MQTT + both OTA paths
+zigbee2mqtt/firebeetle_tank.js   Z2M external converter (ota: true)
+tools/make_ota.py                wrap a build .bin into a Zigbee .ota
+tools/publish_release.ps1        one-command build + GitHub Release + index update
+ota/index.json                   Zigbee OTA index (points at the GitHub Release)
 ```
