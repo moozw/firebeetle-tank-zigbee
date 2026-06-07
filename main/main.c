@@ -36,6 +36,7 @@
 #include "mqtt_client.h"
 #include "esp_https_ota.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_zigbee_core.h"
 
 #include "app_config.h"
@@ -299,6 +300,7 @@ static void wifi_ota_task(void *arg)
         .url = s_ota_url,
         .timeout_ms = 30000,
         .keep_alive_enable = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,  /* verify TLS (e.g. GitHub raw) */
     };
     esp_https_ota_config_t ota_cfg = { .http_config = &http };
     esp_err_t err = esp_https_ota(&ota_cfg);

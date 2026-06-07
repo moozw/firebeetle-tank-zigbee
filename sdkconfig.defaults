@@ -20,3 +20,7 @@ CONFIG_PM_ENABLE=n
 
 # ---- let flash erase/write suspend so the radio cache keeps running during OTA ----
 CONFIG_SPI_FLASH_AUTO_SUSPEND=y
+
+# ---- TLS CA bundle for HTTPS WiFi OTA (GitHub raw etc.) ----
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
