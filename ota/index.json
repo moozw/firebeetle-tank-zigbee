@@ -1,14 +1,13 @@
 [
   {
-    "fileName": "tank2_v1.0.11.ota",
-    "fileVersion": 16777227,
-    "fileSize": 1358078,
+    "fileName": "tank2_v1.0.13.ota",
+    "fileVersion": 16777229,
+    "fileSize": 1599998,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "73e87337499a4e41c4252a6bdd123e009bfffb7f8828dca772e9ce9cebb0b8028c4919197b3d5b9b5a9b5e8fd1575879100a5795c61ee64497158751f4db4e52",
-    "url": "https://raw.githubusercontent.com/moozw/firebeetle-tank-zigbee/main/ota/tank2_v1.0.11.ota",
+    "sha512": "8f77e5db20a6d395c0fbef7a2f7339e05ca91745fb70e922035178a9a40280273090ab93f8e7d94be1aaa7177f17e1c6c5d34cd398c07dd58539a6c9c42a6a3a",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.13/tank2_v1.0.13.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "originalUrl": "https://github.com/moozw/firebeetle-tank-zigbee/blob/main/ota/tank2_v1.0.11.ota",
-    "releaseNotes": "Adds phone setup portal, open-air offset capture, and full-tank calibration."
+    "releaseNotes": "WiFi/MQTT HTTPS OTA, three-level control, on-demand setup portal."
   }
 ]

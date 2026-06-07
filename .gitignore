@@ -30,6 +30,5 @@ zigbee2mqtt/ota_index.json
 Thumbs.db
 Desktop.ini
 
-# ...but DO track published firmware in ota/ (Zigbee .ota + raw .bin for WiFi OTA)
-!ota/*.ota
-!ota/*.bin
+# Firmware binaries live in GitHub Releases, not the repo (see ota/index.json).
+# ota/index.json (the Zigbee OTA index) is small JSON and stays tracked.
