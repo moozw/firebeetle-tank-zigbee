@@ -31,6 +31,7 @@
 #include "nvs.h"
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_wifi.h"
@@ -121,6 +122,7 @@ static bool    g_relay_on  = false;
 static volatile bool g_zb_joined = false;   /* true once on a Zigbee network */
 static volatile int64_t g_join_us = 0;      /* timestamp (us) when we joined   */
 static volatile bool s_ota_active = false;  /* true while an OTA is downloading */
+static volatile bool s_zb_started = false;  /* true once the Zigbee stack is up  */
 static volatile bool s_wifi_connected = false;
 static esp_mqtt_client_handle_t s_mqtt = NULL;
 static volatile bool s_mqtt_connected = false;
@@ -550,23 +552,24 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "<label>Tank height cm<input id=height type=number></label><label>Density kg/m3<input id=density type=number></label>"
         "<label>Mode<select id=mode><option value=0>auto</option><option value=1>force on</option><option value=2>force off</option></select></label>"
         "<label>Connectivity<select id=conn><option value=255>choose</option><option value=0>AP</option><option value=1>zigbee</option><option value=2>local wifi</option></select></label>"
-        "</div></section><section><h2>Local WiFi / MQTT</h2><div class=row>"
+        "</div></section><section id=wifisec><h2>Local WiFi / MQTT</h2><div class=row>"
         "<label>WiFi SSID<input id=ssid></label><label>WiFi password<input id=wpass type=password autocomplete=off></label>"
         "<label>MQTT broker IP/host<input id=mh placeholder='192.168.1.10'></label><label>MQTT topic<input id=mt></label>"
         "<label>MQTT user<input id=mu></label><label>MQTT password<input id=mp type=password autocomplete=off></label>"
         "</div><button onclick=save()>Save parameters</button> <button onclick=saveReboot()>Save &amp; reboot</button></section><p id=msg></p></main><script>"
         "const $=id=>document.getElementById(id);"
-        "let editing=false;"
-        "function bindEdits(){['low','op','full','height','density','mode','conn','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>editing=true;$(id).onchange=()=>editing=true})}"
-        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank'}"
+        "let changed=new Set();"
+        "function toggleWifi(){$('wifisec').style.display=($('conn').value=='2')?'':'none'}"
+        "function bindEdits(){['low','op','full','height','density','mode','conn','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>changed.add(id);$(id).onchange=()=>changed.add(id)});$('conn').addEventListener('change',toggleWifi)}"
+        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';toggleWifi();changed.clear()}"
         "async function load(){let r=await fetch('/api/status');let s=await r.json();"
         "$('baro').textContent=s.baro_hpa.toFixed(2);$('tank').textContent=s.tank_hpa.toFixed(2);$('depth').textContent=s.depth_cm;$('fault').textContent=s.fault;"
         "$('lowalert').textContent=s.low_alert?'ON':'OFF';$('relay').textContent=s.relay?'ON':'OFF';"
         "$('wifistat').textContent=s.wifi_connected?'connected':'off';$('mqttstat').textContent=s.mqtt_connected?'connected':'off';"
         "$('cal').innerHTML=s.calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';"
-        "if(!editing)syncForm(s)}"
-        "async function post(u){let r=await fetch(u,{method:'POST'});$('msg').textContent=await r.text();editing=false;load()}"
-        "async function save(){let q=new URLSearchParams({low:$('low').value,op:$('op').value,full:$('full').value,height:$('height').value,density:$('density').value,mode:$('mode').value,conn:$('conn').value,ssid:$('ssid').value,wpass:$('wpass').value,mh:$('mh').value,mu:$('mu').value,mp:$('mp').value,mt:$('mt').value});let r=await fetch('/api/config',{method:'POST',body:q});$('msg').textContent=await r.text();if(r.ok){editing=false;$('wpass').value='';$('mp').value=''}load();return r.ok}"
+        "if(!changed.size)syncForm(s)}"
+        "async function post(u){let r=await fetch(u,{method:'POST'});$('msg').textContent=await r.text();changed.clear();load()}"
+        "async function save(){let p=new URLSearchParams();changed.forEach(id=>p.append(id,$(id).value));let r=await fetch('/api/config',{method:'POST',body:p});$('msg').textContent=await r.text();if(r.ok){changed.clear();$('wpass').value='';$('mp').value=''}load();return r.ok}"
         "async function saveReboot(){let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Saved — rebooting; reconnect to your WiFi shortly.'}}"
         "bindEdits();load();setInterval(load,3000)</script></body></html>";
     httpd_resp_set_type(req, "text/html");
@@ -837,9 +840,38 @@ static bool setup_boot_button_held(void)
 }
 #endif
 
+/* Full factory reset: wipe our saved config (-> conn_mode UNSET, so it boots into
+ * the setup AP) AND the Zigbee network, then reboot as a brand-new device.
+ * Works in any mode (WiFi/Zigbee/setup). */
+static void factory_reset(void)
+{
+    ESP_LOGW(TAG, "FACTORY RESET: clearing config + Zigbee network");
+    relay_set(false);
+
+    nvs_handle_t h;
+    if (nvs_open("tank", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    if (s_zb_started) {
+        esp_zb_factory_reset();          /* erases Zigbee NVRAM and reboots */
+    } else {
+        /* Zigbee stack not running (WiFi/setup mode): erase its NVRAM directly */
+        const esp_partition_t *p;
+        p = esp_partition_find_first(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, "zb_storage");
+        if (p) esp_partition_erase_range(p, 0, p->size);
+        p = esp_partition_find_first(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, "zb_fct");
+        if (p) esp_partition_erase_range(p, 0, p->size);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        esp_restart();
+    }
+}
+
 /* ----------------------------- button task ------------------------------ */
-/* short press: cycle AUTO -> FORCE_ON -> FORCE_OFF -> AUTO
- * long press (>= BUTTON_LONGPRESS_MS): Zigbee factory reset                  */
+/* runs in ALL modes. short press: cycle AUTO -> FORCE_ON -> FORCE_OFF -> AUTO.
+ * long press (>= BUTTON_LONGPRESS_MS): full factory reset (config + Zigbee). */
 static void button_task(void *arg)
 {
     gpio_config_t io = {
@@ -850,6 +882,10 @@ static void button_task(void *arg)
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io);
+
+    /* If BOOT is still held from startup (used to enter the setup AP), wait for
+     * release first so it isn't mistaken for a runtime long-press reset. */
+    while (gpio_get_level(BUTTON_GPIO) == 0) vTaskDelay(pdMS_TO_TICKS(20));
 
     bool prev_down = false;
     int64_t press_us = 0;
@@ -864,10 +900,9 @@ static void button_task(void *arg)
             long_fired = false;
         } else if (down && !long_fired &&
                    (now - press_us) >= (int64_t)BUTTON_LONGPRESS_MS * 1000) {
-            ESP_LOGW(TAG, "long press -> Zigbee factory reset");
+            ESP_LOGW(TAG, "long press -> full factory reset");
             long_fired = true;
-            relay_set(false);
-            esp_zb_factory_reset();          /* erases network, reboots */
+            factory_reset();                 /* clears config + Zigbee, reboots */
         } else if (!down && prev_down && !long_fired) {
             if ((now - press_us) >= (int64_t)BUTTON_DEBOUNCE_MS * 1000) {
                 uint8_t m;
@@ -1232,6 +1267,7 @@ static void add_custom_cluster(esp_zb_cluster_list_t *list)
 
 static void esp_zb_task(void *arg)
 {
+    s_zb_started = true;
     esp_zb_cfg_t nwk = {
         .esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER,
         .install_code_policy = false,
@@ -1405,8 +1441,8 @@ void app_main(void)
     }
 
     xTaskCreate(control_task, "control", 4096, NULL, 5, NULL);
+    xTaskCreate(button_task, "button", 3072, NULL, 4, NULL);  /* BOOT reset in any mode */
     if (start_zigbee) {
-        xTaskCreate(button_task, "button", 3072, NULL, 4, NULL);
         xTaskCreate(esp_zb_task, "zigbee", 8192, NULL, 6, NULL);
     }
 }

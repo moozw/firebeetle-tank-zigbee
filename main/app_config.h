@@ -113,7 +113,7 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x0100000F   /* 1.0.0.15 - URL-decode setup form (fixes WiFi/MQTT passwords) */
+#define OTA_FW_VERSION      0x01000010   /* 1.0.0.16 - changed-fields-only save, hide WiFi sec, BOOT full factory reset any mode */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101
