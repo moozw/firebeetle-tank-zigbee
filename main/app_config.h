@@ -63,6 +63,7 @@
  * It stores calibration/config in the same NVS blob used by Zigbee. */
 #define SETUP_PORTAL_ENABLE     1
 #define SETUP_AP_SSID_PREFIX    "TankSetup"
+#define SETUP_AP_PASSWORD       "tanksetup"
 #define SETUP_AP_CHANNEL        6
 #define SETUP_AP_MAX_CONN       2
 

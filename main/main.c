@@ -367,9 +367,10 @@ static void setup_portal_start(void)
     wifi_config_t ap_cfg = {0};
     snprintf((char *)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), "%s-%02X%02X", SETUP_AP_SSID_PREFIX, mac[4], mac[5]);
     ap_cfg.ap.ssid_len = strlen((char *)ap_cfg.ap.ssid);
+    strlcpy((char *)ap_cfg.ap.password, SETUP_AP_PASSWORD, sizeof(ap_cfg.ap.password));
     ap_cfg.ap.channel = SETUP_AP_CHANNEL;
     ap_cfg.ap.max_connection = SETUP_AP_MAX_CONN;
-    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
