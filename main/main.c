@@ -31,6 +31,7 @@
 #include "esp_http_server.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "mdns.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_timer.h"
@@ -704,40 +705,45 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "main{max-width:760px;margin:auto;padding:18px}section{background:white;border:1px solid #d8e0e4;border-radius:8px;padding:14px;margin:12px 0}"
         "h1{font-size:24px;margin:4px 0 12px}h2{font-size:17px;margin:0 0 10px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}"
         ".v{padding:10px;background:#eef3f5;border-radius:6px}label{display:block;font-size:13px;margin:10px 0 3px}input,select,button{font:inherit;padding:10px;border-radius:6px;border:1px solid #b8c4ca;box-sizing:border-box;width:100%;color:#172026;background:#fff}"
-        "button{background:#0b6f85;color:white;border:0;margin-top:10px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.warn{color:#9a4b00}.ok{color:#157347}"
+        "button{background:#0b6f85;color:white;border:0;margin-top:10px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.warn{color:#9a4b00}.ok{color:#157347}.hint{font-size:13px;color:#5a6870;margin:8px 0}.bad{color:#b42318}"
         "</style></head><body><main><h1>Tank Controller Setup</h1>"
         "<section><h2>Live Sensor Check</h2><div class=grid>"
         "<div class=v>Baro <b id=baro>-</b> hPa</div><div class=v>Tank <b id=tank>-</b> hPa</div>"
-        "<div class=v>External <b id=exttemp>-</b> C</div><div class=v>Water <b id=watertemp>-</b> C</div>"
+        "<div class=v>Reference temp <b id=exttemp>-</b> C</div><div class=v>Tank temp <b id=watertemp>-</b> C</div>"
         "<div class=v>Depth <b id=depth>-</b> cm</div><div class=v>Low alert <b id=lowalert>-</b></div>"
         "<div class=v>Relay <b id=relay>-</b></div><div class=v>Fault <b id=fault>-</b></div>"
         "<div class=v>Lockout <b id=lockstat>-</b></div><div class=v>Clock <b id=clockstat>-</b></div>"
         "<div class=v>WiFi <b id=wifistat>-</b></div><div class=v>MQTT <b id=mqttstat>-</b></div>"
         "</div><p id=cal></p></section>"
-        "<section><h2>1. Open-Air Test</h2><p>Keep both sensors in open air, then save the offset.</p><button onclick=\"post('/api/open_air')\">Run open-air test</button></section>"
-        "<section><h2>2. Full Tank Calibration</h2><p>Lower the tank sensor into a full tank, keep the baro sensor in air, then save full.</p><button onclick=\"post('/api/full_tank')\">Set full tank</button></section>"
-        "<section><h2>Operating Parameters</h2><div class=row>"
+        "<section><h2>1. Open-Air Test</h2><p>Keep both sensors in open air, then save the offset.</p><button onclick=\"calPost('/api/open_air','This will replace the saved open-air offset. Continue?')\">Run open-air test</button></section>"
+        "<section><h2>2. Full Tank Calibration</h2><p>Lower the tank sensor into a full tank, keep the baro sensor in air, then save full.</p><button onclick=\"calPost('/api/full_tank','This will replace full-tank calibration and reset level setpoints. Continue?')\">Set full tank</button></section>"
+        "<section><h2>Operating Parameters</h2><p class=hint>Use: Low alert <= Operating level < Full level <= Tank height.</p><div class=row>"
         "<label>Low alert cm<input id=low type=number></label><label>Operating level cm<input id=op type=number></label>"
         "<label>Full level cm<input id=full type=number></label>"
         "<label>Tank height cm<input id=height type=number></label><label>Density kg/m3<input id=density type=number></label>"
         "<label>Mode<select id=mode><option value=0>auto</option><option value=1>force on</option><option value=2>force off</option></select></label>"
         "<label>Connectivity<select id=conn><option value=255>choose</option><option value=0>standalone</option><option value=1>zigbee</option><option value=2>local wifi</option></select></label>"
-        "<label>Pump lockout<select id=lock><option value=0>off</option><option value=1>on / scheduled</option></select></label>"
-        "<label>Lockout start min<input id=lstart type=number min=0 max=1439></label><label>Lockout end min<input id=lend type=number min=0 max=1439></label>"
+        "<label>Pump lockout<select id=lock><option value=0>off</option><option value=1>on</option></select></label>"
+        "</div><p id=lockhint class=hint></p><div id=locktimes class=row>"
+        "<label>Lockout start<input id=lstart type=time></label><label>Lockout end<input id=lend type=time></label>"
         "</div></section><section id=wifisec><h2>Local WiFi / MQTT</h2><div class=row>"
         "<label>WiFi SSID<input id=ssid></label><label>WiFi password<input id=wpass type=password autocomplete=off></label>"
         "<label>MQTT broker IP/host<input id=mh placeholder='192.168.1.10'></label><label>MQTT topic<input id=mt></label>"
         "<label>MQTT user<input id=mu></label><label>MQTT password<input id=mp type=password autocomplete=off></label>"
         "</div></section>"
-        "<section><h2>Save</h2><p id=connhint class=warn></p>"
+        "<section><h2>Save</h2><p id=cal2 class=warn></p><p id=connhint class=warn></p><p id=rulehint class=hint></p>"
         "<button onclick=save()>Save parameters</button> <button onclick=saveReboot()>Save &amp; reboot</button></section>"
-        "<p id=msg></p></main><script>"
+        "<p id=msg></p><p class=hint>Hold button 3s to reopen setup. Hold 10s for factory reset.</p></main><script>"
         "const $=id=>document.getElementById(id);"
-        "let changed=new Set();let formInit=false;"
-        "function toggleWifi(){var c=$('conn').value;$('wifisec').style.display=(c=='2')?'':'none';"
-        "$('connhint').textContent=(c=='1')?'Zigbee selected - Save & reboot to leave setup and join your Zigbee network.':(c=='2')?'Local WiFi selected - fill in WiFi/MQTT above, then Save & reboot.':(c=='0')?'Standalone selected - Save & reboot to run locally with no WiFi AP.':'Choose a connectivity option, then Save & reboot.'}"
-        "function bindEdits(){['low','op','full','height','density','mode','conn','lock','lstart','lend','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>changed.add(id);$(id).onchange=()=>changed.add(id)});$('conn').addEventListener('change',toggleWifi)}"
-        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('lock').value=s.lockout_enabled;$('lstart').value=s.lockout_start_min;$('lend').value=s.lockout_end_min;$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';toggleWifi();changed.clear()}"
+        "let changed=new Set();let formInit=false;let calibrated=false;"
+        "function pad(n){return String(n).padStart(2,'0')}function minToTime(m){m=Number(m)||0;return pad(Math.floor(m/60))+':'+pad(m%60)}function timeToMin(v){let p=(v||'00:00').split(':');return (Number(p[0])||0)*60+(Number(p[1])||0)}"
+        "function updateHints(){var c=$('conn').value;var lock=$('lock').value;$('wifisec').style.display=(c=='2')?'':'none';$('locktimes').style.display=(c=='2'&&lock=='1')?'':'none';"
+        "$('lockhint').textContent=(c=='1')?'Zigbee mode: Home Assistant controls pump lockout.':(c=='2')?'Local WiFi mode: lockout uses the schedule below.':'Standalone mode: lockout is a manual pump inhibit.';"
+        "$('connhint').textContent=(c=='1')?'Zigbee selected: AP will disappear and the device will join Zigbee.':(c=='2')?'Local WiFi selected: AP will disappear; setup moves to the local WiFi address.':(c=='0')?'Standalone selected: AP will disappear; hold button 3s to reopen setup.':'Choose a connectivity option, then Save & reboot.';"
+        "validateLocal()}"
+        "function validateLocal(){let lo=Number($('low').value),op=Number($('op').value),fu=Number($('full').value),hi=Number($('height').value);let ok=lo>=0&&op>=lo&&fu>op&&fu<=hi+20;$('rulehint').textContent=ok?'Level order looks valid.':'Check level order: low <= operating < full <= tank height.';$('rulehint').className=ok?'hint':'hint bad';return ok}"
+        "function bindEdits(){['low','op','full','height','density','mode','conn','lock','lstart','lend','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>{changed.add(id);updateHints()};$(id).onchange=()=>{changed.add(id);updateHints()}})}"
+        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('lock').value=s.lockout_enabled;$('lstart').value=minToTime(s.lockout_start_min);$('lend').value=minToTime(s.lockout_end_min);$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';updateHints();changed.clear()}"
         "async function refresh(){let s=await(await fetch('/api/status')).json();syncForm(s)}"
         "async function load(){let r=await fetch('/api/status');let s=await r.json();"
         "$('baro').textContent=s.baro_hpa.toFixed(2);$('tank').textContent=s.tank_hpa.toFixed(2);$('depth').textContent=s.depth_cm;$('fault').textContent=s.fault;"
@@ -745,11 +751,12 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "$('lowalert').textContent=s.low_alert?'ON':'OFF';$('relay').textContent=s.relay?'ON':'OFF';"
         "$('lockstat').textContent=s.lockout_active?'ON':'off';$('clockstat').textContent=s.time_valid?'synced':'not synced';"
         "$('wifistat').textContent=s.wifi_connected?'connected':'off';$('mqttstat').textContent=s.mqtt_connected?'connected':'off';"
-        "$('cal').innerHTML=s.calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';"
+        "calibrated=!!s.calibrated;let cal=calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';$('cal').innerHTML=cal;$('cal2').innerHTML=calibrated?'':cal;"
         "if(!formInit){syncForm(s);formInit=true}}"
         "async function post(u){let r=await fetch(u,{method:'POST'});$('msg').textContent=await r.text();refresh()}"
-        "async function save(){let p=new URLSearchParams();changed.forEach(id=>p.append(id,$(id).value));let r=await fetch('/api/config',{method:'POST',body:p});$('msg').textContent=await r.text();if(r.ok){$('wpass').value='';$('mp').value='';refresh()}return r.ok}"
-        "async function saveReboot(){let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Saved - rebooting into the selected mode; this AP will disappear.'}}"
+        "async function calPost(u,msg){if(calibrated&&!confirm(msg))return;await post(u)}"
+        "async function save(){let p=new URLSearchParams();changed.forEach(id=>{let v=$(id).value;if(id=='lstart'||id=='lend')v=timeToMin(v);p.append(id,v)});let r=await fetch('/api/config',{method:'POST',body:p});$('msg').textContent=await r.text();if(r.ok){$('wpass').value='';$('mp').value='';refresh()}return r.ok}"
+        "async function saveReboot(){let mode=$('conn').value;let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent=(mode=='2')?'Saved - rebooting; this AP will disappear and the page will move to local WiFi.':(mode=='1')?'Saved - rebooting; this AP will disappear and the device will join Zigbee.':'Saved - rebooting; this AP will disappear. Hold button 3s to reopen setup.'}}"
         "bindEdits();load();setInterval(load,3000)</script></body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -876,11 +883,26 @@ static esp_err_t setup_reboot_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Advertise http://tank.local on whatever interface is up (STA or AP) so the
+ * setup page is reachable without hunting for the DHCP address. */
+static void mdns_start(void)
+{
+    static bool started = false;
+    if (started) return;
+    if (mdns_init() != ESP_OK) { ESP_LOGW(TAG, "mDNS init failed"); return; }
+    mdns_hostname_set("tank");
+    mdns_instance_name_set("Tank Controller");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    started = true;
+    ESP_LOGI(TAG, "mDNS up: http://tank.local");
+}
+
 static void web_server_start(void)
 {
     if (s_httpd) return;
     httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
     http_cfg.lru_purge_enable = true;
+    http_cfg.stack_size = 8192;
     ESP_ERROR_CHECK(httpd_start(&s_httpd, &http_cfg));
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/", .method=HTTP_GET, .handler=setup_root_get });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/status", .method=HTTP_GET, .handler=setup_status_get });
@@ -888,6 +910,7 @@ static void web_server_start(void)
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/full_tank", .method=HTTP_POST, .handler=setup_full_tank_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/config", .method=HTTP_POST, .handler=setup_config_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/reboot", .method=HTTP_POST, .handler=setup_reboot_post });
+    mdns_start();
 }
 
 static void time_sync_start(void)
