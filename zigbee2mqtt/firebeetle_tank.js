@@ -84,12 +84,15 @@ const tzTank = {
         };
         const [attr, type] = W[key];
         const raw = key === 'mode' ? MODE_REV[value] : value;
-        await entity.write(CLUSTER, {[attr]: {value: raw, type}}, {manufacturerCode: MANUFACTURER_CODE});
+        // NB: firmware registers 0xFC11 attrs as plain (non-manufacturer-specific),
+        // so reads/writes must NOT carry a manufacturerCode or the device replies
+        // UNSUPPORTED_ATTRIBUTE. (MANUFACTURER_CODE kept for reference only.)
+        await entity.write(CLUSTER, {[attr]: {value: raw, type}});
         return {state: {[key]: value}};
     },
     convertGet: async (entity, key, meta) => {
         const R = {level_low: 0x10, level_full: 0x11, tank_height: 0x12, density: 0x13, mode: 0x14, operating_level: 0x15};
-        await entity.read(CLUSTER, [R[key]], {manufacturerCode: MANUFACTURER_CODE});
+        await entity.read(CLUSTER, [R[key]]);
     },
 };
 
@@ -106,7 +109,7 @@ const tzTankRead = {
             return;
         }
         const R = {depth: 0x00, level: 0x01, fault: 0x02, baro_pressure: 0x03, tank_pressure: 0x04, low_alert: 0x05};
-        await entity.read(CLUSTER, [R[key]], {manufacturerCode: MANUFACTURER_CODE});
+        await entity.read(CLUSTER, [R[key]]);
     },
 };
 
@@ -140,7 +143,7 @@ module.exports = [
                     {attribute: {ID: 0x03, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
                     {attribute: {ID: 0x04, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
                     {attribute: {ID: 0x05, type: U8},  minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
-                ], {manufacturerCode: MANUFACTURER_CODE});
+                ]);
             } catch (e) {}
         },
         exposes: [
