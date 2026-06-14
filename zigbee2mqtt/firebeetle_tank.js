@@ -140,24 +140,24 @@ module.exports = [
             try {
                 await ep.bind(PRESSURE_CLUSTER, coordinatorEndpoint);
                 await ep.configureReporting(PRESSURE_CLUSTER, [
-                    {attribute: {ID: 0x0000, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
-                    {attribute: {ID: 0x0010, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
+                    {attribute: {ID: 0x0000, type: S16}, minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 1},
+                    {attribute: {ID: 0x0010, type: S16}, minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 1},
                 ]);
             } catch (e) {}
             // custom telemetry auto-reporting (best effort)
             try {
                 await ep.bind(CLUSTER, coordinatorEndpoint);
                 await ep.configureReporting(CLUSTER, [
-                    {attribute: {ID: 0x00, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
-                    {attribute: {ID: 0x01, type: U8},  minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
-                    {attribute: {ID: 0x02, type: U8},  minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
-                    {attribute: {ID: 0x03, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
-                    {attribute: {ID: 0x04, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 1},
-                    {attribute: {ID: 0x05, type: U8},  minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
-                    {attribute: {ID: 0x06, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 25},
-                    {attribute: {ID: 0x07, type: S16}, minimumReportInterval: 0, maximumReportInterval: 300, reportableChange: 25},
-                    {attribute: {ID: 0x19, type: U8},  minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
-                    {attribute: {ID: 0x1A, type: U8},  minimumReportInterval: 0, maximumReportInterval: 3600, reportableChange: 0},
+                    {attribute: {ID: 0x00, type: S16}, minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 1},
+                    {attribute: {ID: 0x01, type: U8},  minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 1},
+                    {attribute: {ID: 0x02, type: U8},  minimumReportInterval: 0, maximumReportInterval: 120, reportableChange: 0},
+                    {attribute: {ID: 0x03, type: S16}, minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 1},
+                    {attribute: {ID: 0x04, type: S16}, minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 1},
+                    {attribute: {ID: 0x05, type: U8},  minimumReportInterval: 0, maximumReportInterval: 120, reportableChange: 0},
+                    {attribute: {ID: 0x06, type: S16}, minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 25},
+                    {attribute: {ID: 0x07, type: S16}, minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 25},
+                    {attribute: {ID: 0x19, type: U8},  minimumReportInterval: 0, maximumReportInterval: 120, reportableChange: 0},
+                    {attribute: {ID: 0x1A, type: U8},  minimumReportInterval: 0, maximumReportInterval: 120, reportableChange: 0},
                 ]);
             } catch (e) {}
         },

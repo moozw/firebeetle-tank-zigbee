@@ -614,48 +614,25 @@ static void zb_push_telemetry(void)
     if (!zb_ready()) return;
     esp_zb_lock_acquire(portMAX_DELAY);
 
-    /* Update attribute values with check_change=true so the stack emits an
-     * on-change report (on top of the periodic maxReportInterval) for every
-     * attribute the coordinator has configured for reporting. With false, only
-     * the 5-min periodic report fired - which is why even the pressures looked
-     * frozen and depth/level/fault never moved. We still do NOT issue manual
-     * report commands (those assert if sent before the stack settles); zb_ready()
-     * already gates this to >=30s post-join and not-mid-OTA. NB: the custom
-     * 0xFC11 attrs only report once Z2M has run Configure with the (now
-     * manufacturer-code-free) reporting setup. */
-    esp_err_t err = esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_DEPTH_CM, &g_depth_cm, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LEVEL_PCT, &g_level_pct, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_FAULT, &g_fault, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LOW_ALERT, &g_low_alert, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_BARO_PRESSURE_HPA, &g_baro_pressure_hpa, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TANK_PRESSURE_HPA, &g_tank_pressure_hpa, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_EXTERNAL_TEMP_CX100, &g_external_temp_c_x100, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_WATER_TEMP_CX100, &g_water_temp_c_x100, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LOCKOUT_ACTIVE, &g_lockout_active, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TIME_VALID, &g_time_valid, true);
-
+    /* Update the local attribute values only (check_change=false). The hub's
+     * configureReporting (Z2M "Reconfigure") drives the periodic reports. We must
+     * NOT issue manual esp_zb_zcl_report_attr_cmd_req (asserts in
+     * zcl_general_commands.c:612) nor use check_change=true (returns an error
+     * every cycle and stalls telemetry). */
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_DEPTH_CM, &g_depth_cm, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LEVEL_PCT, &g_level_pct, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_FAULT, &g_fault, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LOW_ALERT, &g_low_alert, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_BARO_PRESSURE_HPA, &g_baro_pressure_hpa, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TANK_PRESSURE_HPA, &g_tank_pressure_hpa, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_EXTERNAL_TEMP_CX100, &g_external_temp_c_x100, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_WATER_TEMP_CX100, &g_water_temp_c_x100, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LOCKOUT_ACTIVE, &g_lockout_active, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TIME_VALID, &g_time_valid, false);
     uint8_t on = g_relay_on ? 1 : 0;
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID,
-        &g_baro_pressure_hpa, true);
-    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_SCALED_VALUE_ID,
-        &g_tank_pressure_hpa, true);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Zigbee telemetry attr update failed: %s", esp_err_to_name(err));
-    }
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID, &g_baro_pressure_hpa, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_SCALED_VALUE_ID, &g_tank_pressure_hpa, false);
 
     esp_zb_lock_release();
 }
