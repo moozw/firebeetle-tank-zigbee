@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "tank2_v1.0.16.ota",
-    "fileVersion": 16777232,
-    "fileSize": 1600958,
+    "fileName": "tank2_v1.0.17.ota",
+    "fileVersion": 16777233,
+    "fileSize": 1601662,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "bdb10787a91f6aa08fa37e2722a337dfa24df5e2d6b855391b4346901b94303679a81d01a09aa2dfa14ff2ff89125d8359c4c4dc21be8a69939bb523ecc3f0ce",
-    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.16/tank2_v1.0.16.ota",
+    "sha512": "94c9f905d2191dc364c7dbec4b62d19eb7452752bb80a1bd824f6682237bc05303060ec0f32264f55ee95ae4ad4ff03d7a3dd9cf473b707d60122416450b18c1",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.17/tank2_v1.0.17.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.16 (OTA version 0x01000010)."
+    "releaseNotes": "Firmware v1.0.17 (OTA version 0x01000011)."
   }
 ]
