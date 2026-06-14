@@ -477,6 +477,11 @@ static void wifi_ota_task(void *arg)
         .timeout_ms = 30000,
         .keep_alive_enable = true,
         .crt_bundle_attach = esp_crt_bundle_attach,  /* verify TLS (e.g. GitHub raw) */
+        /* GitHub release assets 302-redirect to a CDN whose response headers and
+         * long signed redirect URL overflow the 512-byte default -> "Out of
+         * buffer". Enlarge both header buffers so the redirect can be followed. */
+        .buffer_size = 4096,
+        .buffer_size_tx = 2048,
     };
     esp_https_ota_config_t ota_cfg = { .http_config = &http };
     esp_err_t err = esp_https_ota(&ota_cfg);
