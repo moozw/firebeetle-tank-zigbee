@@ -556,21 +556,26 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "<label>WiFi SSID<input id=ssid></label><label>WiFi password<input id=wpass type=password autocomplete=off></label>"
         "<label>MQTT broker IP/host<input id=mh placeholder='192.168.1.10'></label><label>MQTT topic<input id=mt></label>"
         "<label>MQTT user<input id=mu></label><label>MQTT password<input id=mp type=password autocomplete=off></label>"
-        "</div><button onclick=save()>Save parameters</button> <button onclick=saveReboot()>Save &amp; reboot</button></section><p id=msg></p></main><script>"
+        "</div></section>"
+        "<section><h2>Save</h2><p id=connhint class=warn></p>"
+        "<button onclick=save()>Save parameters</button> <button onclick=saveReboot()>Save &amp; reboot</button></section>"
+        "<p id=msg></p></main><script>"
         "const $=id=>document.getElementById(id);"
-        "let changed=new Set();"
-        "function toggleWifi(){$('wifisec').style.display=($('conn').value=='2')?'':'none'}"
+        "let changed=new Set();let formInit=false;"
+        "function toggleWifi(){var c=$('conn').value;$('wifisec').style.display=(c=='2')?'':'none';"
+        "$('connhint').textContent=(c=='1')?'Zigbee selected - Save & reboot to leave setup and join your Zigbee network.':(c=='2')?'Local WiFi selected - fill in WiFi/MQTT above, then Save & reboot.':(c=='0')?'AP/setup mode stays active after reboot.':'Choose a connectivity option, then Save & reboot.'}"
         "function bindEdits(){['low','op','full','height','density','mode','conn','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>changed.add(id);$(id).onchange=()=>changed.add(id)});$('conn').addEventListener('change',toggleWifi)}"
         "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';toggleWifi();changed.clear()}"
+        "async function refresh(){let s=await(await fetch('/api/status')).json();syncForm(s)}"
         "async function load(){let r=await fetch('/api/status');let s=await r.json();"
         "$('baro').textContent=s.baro_hpa.toFixed(2);$('tank').textContent=s.tank_hpa.toFixed(2);$('depth').textContent=s.depth_cm;$('fault').textContent=s.fault;"
         "$('lowalert').textContent=s.low_alert?'ON':'OFF';$('relay').textContent=s.relay?'ON':'OFF';"
         "$('wifistat').textContent=s.wifi_connected?'connected':'off';$('mqttstat').textContent=s.mqtt_connected?'connected':'off';"
         "$('cal').innerHTML=s.calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';"
-        "if(!changed.size)syncForm(s)}"
-        "async function post(u){let r=await fetch(u,{method:'POST'});$('msg').textContent=await r.text();changed.clear();load()}"
-        "async function save(){let p=new URLSearchParams();changed.forEach(id=>p.append(id,$(id).value));let r=await fetch('/api/config',{method:'POST',body:p});$('msg').textContent=await r.text();if(r.ok){changed.clear();$('wpass').value='';$('mp').value=''}load();return r.ok}"
-        "async function saveReboot(){let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Saved — rebooting; reconnect to your WiFi shortly.'}}"
+        "if(!formInit){syncForm(s);formInit=true}}"
+        "async function post(u){let r=await fetch(u,{method:'POST'});$('msg').textContent=await r.text();refresh()}"
+        "async function save(){let p=new URLSearchParams();changed.forEach(id=>p.append(id,$(id).value));let r=await fetch('/api/config',{method:'POST',body:p});$('msg').textContent=await r.text();if(r.ok){$('wpass').value='';$('mp').value='';refresh()}return r.ok}"
+        "async function saveReboot(){let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Saved - rebooting into the selected mode; this AP will disappear.'}}"
         "bindEdits();load();setInterval(load,3000)</script></body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -955,6 +960,18 @@ static void control_task(void *arg)
         xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
         cfg = g_cfg;
         xSemaphoreGive(g_cfg_mtx);
+
+        /* hot-plug: a sensor not present at boot (e.g. the submerged probe on a
+         * long cable connected after power-up) gets picked up here so it works
+         * in WiFi/Zigbee mode too, not just when present during the boot scan. */
+        if (!baro_ok && lps2x_init(bus, LPS_BARO_ADDR, &baro) == ESP_OK) {
+            baro_ok = true;
+            ESP_LOGI(TAG, "baro sensor (0x%02x) appeared", LPS_BARO_ADDR);
+        }
+        if (!tank_ok && lps2x_init(bus, LPS_TANK_ADDR, &tank) == ESP_OK) {
+            tank_ok = true;
+            ESP_LOGI(TAG, "tank sensor (0x%02x) appeared", LPS_TANK_ADDR);
+        }
 
         /* read whichever sensors are present (each independent), averaging a
          * few slow one-shot conversions to calm long wires and startup noise. */
