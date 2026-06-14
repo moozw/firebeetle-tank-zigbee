@@ -51,12 +51,13 @@ const fzTank = {
         if (baroPressure !== undefined) r.baro_pressure = baroPressure;
         if (tankPressure !== undefined) r.tank_pressure = tankPressure;
         if (lowAlert !== undefined) r.low_alert = lowAlert ? 'ON' : 'OFF';
-        if (d['16'] !== undefined) r.level_low    = d['16'];
-        if (d['17'] !== undefined) r.level_full   = d['17'];
-        if (d['18'] !== undefined) r.tank_height  = d['18'];
-        if (d['19'] !== undefined) r.density       = d['19'];
-        if (d['20'] !== undefined) r.mode          = MODE_MAP[d['20']];
-        if (d['21'] !== undefined) r.operating_level = d['21'];
+        // config setpoints - names mirror the WiFi setup portal labels
+        if (d['16'] !== undefined) r.low_alert_cm   = d['16'];   // 0x10 "Low alert cm"
+        if (d['17'] !== undefined) r.full_cm        = d['17'];   // 0x11 "Full level cm"
+        if (d['18'] !== undefined) r.tank_height_cm = d['18'];   // 0x12 "Tank height cm"
+        if (d['19'] !== undefined) r.density        = d['19'];   // 0x13 "Density"
+        if (d['20'] !== undefined) r.mode           = MODE_MAP[d['20']]; // 0x14 "Mode"
+        if (d['21'] !== undefined) r.operating_cm   = d['21'];   // 0x15 "Operating level cm"
         return r;
     },
 };
@@ -75,12 +76,12 @@ const fzPressure = {
 
 // settable config attributes
 const tzTank = {
-    key: ['level_low', 'operating_level', 'level_full', 'tank_height', 'density', 'mode'],
+    key: ['low_alert_cm', 'operating_cm', 'full_cm', 'tank_height_cm', 'density', 'mode'],
     convertSet: async (entity, key, value, meta) => {
         const W = {
-            level_low:   [0x10, S16], level_full:  [0x11, S16],
-            tank_height: [0x12, S16], density:     [0x13, U16], mode: [0x14, U8],
-            operating_level: [0x15, S16],
+            low_alert_cm:   [0x10, S16], full_cm:       [0x11, S16],
+            tank_height_cm: [0x12, S16], density:       [0x13, U16], mode: [0x14, U8],
+            operating_cm:   [0x15, S16],
         };
         const [attr, type] = W[key];
         const raw = key === 'mode' ? MODE_REV[value] : value;
@@ -91,7 +92,7 @@ const tzTank = {
         return {state: {[key]: value}};
     },
     convertGet: async (entity, key, meta) => {
-        const R = {level_low: 0x10, level_full: 0x11, tank_height: 0x12, density: 0x13, mode: 0x14, operating_level: 0x15};
+        const R = {low_alert_cm: 0x10, full_cm: 0x11, tank_height_cm: 0x12, density: 0x13, mode: 0x14, operating_cm: 0x15};
         await entity.read(CLUSTER, [R[key]]);
     },
 };
@@ -151,23 +152,24 @@ module.exports = [
             e.numeric('depth', ea.STATE_GET).withUnit('cm').withDescription('Water depth above sensor'),
             e.numeric('level', ea.STATE_GET).withUnit('%').withDescription('Tank level'),
             e.binary('fault', ea.STATE_GET, 'ON', 'OFF').withDescription('Sensor fault (pump forced off)'),
-            e.binary('low_alert', ea.STATE_GET, 'ON', 'OFF').withDescription('Low level alert'),
+            e.binary('low_alert', ea.STATE_GET, 'ON', 'OFF')
+                .withDescription('Low alert active (depth at/below the Low alert level)'),
             e.numeric('baro_pressure', ea.STATE_GET).withUnit('hPa')
                 .withDescription('Barometric reference pressure'),
             e.numeric('tank_pressure', ea.STATE_GET).withUnit('hPa')
                 .withDescription('Tank sensor absolute pressure'),
-            e.numeric('level_low', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
-                .withDescription('Low-level alert point'),
-            e.numeric('operating_level', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
-                .withDescription('Pump turns ON at/below this depth'),
-            e.numeric('level_full', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
-                .withDescription('Pump turns OFF at/above this depth'),
-            e.numeric('tank_height', ea.ALL).withUnit('cm').withValueMin(1).withValueMax(500)
-                .withDescription('Full-scale height used for level %'),
+            e.numeric('low_alert_cm', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
+                .withDescription('Low alert level (WiFi setup: "Low alert cm")'),
+            e.numeric('operating_cm', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
+                .withDescription('Operating level - pump ON at/below (WiFi setup: "Operating level cm")'),
+            e.numeric('full_cm', ea.ALL).withUnit('cm').withValueMin(0).withValueMax(300)
+                .withDescription('Full level - pump OFF at/above (WiFi setup: "Full level cm")'),
+            e.numeric('tank_height_cm', ea.ALL).withUnit('cm').withValueMin(1).withValueMax(500)
+                .withDescription('Tank height (WiFi setup: "Tank height cm")'),
             e.numeric('density', ea.ALL).withUnit('kg/m3').withValueMin(900).withValueMax(1100)
-                .withDescription('Liquid density (fresh ~997, sea ~1025)'),
+                .withDescription('Density kg/m3 (fresh ~997, sea ~1025)'),
             e.enum('mode', ea.ALL, ['auto', 'force_on', 'force_off'])
-                .withDescription('Control mode / manual override'),
+                .withDescription('Mode (auto / force on / force off)'),
         ],
     },
 ];
