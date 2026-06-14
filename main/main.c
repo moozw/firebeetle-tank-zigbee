@@ -18,6 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdint.h>
+#include <limits.h>
+#include <stddef.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -35,6 +39,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_wifi.h"
+#include "esp_sntp.h"
 #include "mqtt_client.h"
 #include "esp_https_ota.h"
 #include "esp_http_client.h"
@@ -65,11 +70,14 @@ typedef struct {
     char     mqtt_user[33];
     char     mqtt_pass[65];
     char     mqtt_topic[33];
+    uint8_t  lockout_enabled;
+    uint16_t lockout_start_min;
+    uint16_t lockout_end_min;
 } cfg_t;
 
 static cfg_t g_cfg = {
     .magic     = 0x544b,     /* "TK" */
-    .version   = 4,
+    .version   = 5,
     .calibrated = 0,
     .low_cm    = DEFAULT_LEVEL_LOW_CM,
     .operating_cm = DEFAULT_OPERATING_CM,
@@ -78,6 +86,9 @@ static cfg_t g_cfg = {
     .density   = DEFAULT_WATER_DENSITY,
     .mode      = MODE_AUTO,
     .conn_mode = CONN_UNSET,
+    .lockout_enabled = 0,
+    .lockout_start_min = DEFAULT_LOCKOUT_START_MIN,
+    .lockout_end_min = DEFAULT_LOCKOUT_END_MIN,
     .air_offset_hpa_x100 = 0,
     .wifi_ssid = "",
     .wifi_pass = "",
@@ -91,7 +102,7 @@ static void cfg_save(void);
 
 static const cfg_t DEFAULT_CFG = {
     .magic     = 0x544b,
-    .version   = 4,
+    .version   = 5,
     .calibrated = 0,
     .low_cm    = DEFAULT_LEVEL_LOW_CM,
     .operating_cm = DEFAULT_OPERATING_CM,
@@ -100,6 +111,9 @@ static const cfg_t DEFAULT_CFG = {
     .density   = DEFAULT_WATER_DENSITY,
     .mode      = MODE_AUTO,
     .conn_mode = CONN_UNSET,
+    .lockout_enabled = 0,
+    .lockout_start_min = DEFAULT_LOCKOUT_START_MIN,
+    .lockout_end_min = DEFAULT_LOCKOUT_END_MIN,
     .air_offset_hpa_x100 = 0,
     .wifi_ssid = "",
     .wifi_pass = "",
@@ -109,15 +123,44 @@ static const cfg_t DEFAULT_CFG = {
     .mqtt_topic = DEFAULT_MQTT_TOPIC,
 };
 
+static const char *cfg_validate(const cfg_t *cfg, bool require_wifi_ssid)
+{
+    if (cfg->magic != DEFAULT_CFG.magic || cfg->version != DEFAULT_CFG.version) return "version";
+    if (cfg->calibrated > 1) return "calibrated";
+    if (cfg->low_cm < 0) return "low_cm";
+    if (cfg->operating_cm < 0) return "operating_cm";
+    if (cfg->operating_cm < cfg->low_cm) return "operating_below_low";
+    if (cfg->full_cm <= cfg->operating_cm) return "full_below_operating";
+    if (cfg->tank_h_cm < 10 || cfg->tank_h_cm > 1000) return "tank_height";
+    if (cfg->full_cm > cfg->tank_h_cm + MAX_DEPTH_OVER_TANK_CM) return "full_above_tank";
+    if (cfg->density < 900 || cfg->density > 1100) return "density";
+    if (cfg->mode > MODE_OFF) return "mode";
+    if (cfg->conn_mode != CONN_UNSET && cfg->conn_mode > CONN_WIFI) return "conn_mode";
+    if (require_wifi_ssid && cfg->conn_mode == CONN_WIFI && !cfg->wifi_ssid[0]) return "wifi_ssid";
+    if (cfg->lockout_enabled > 1) return "lockout_enabled";
+    if (cfg->lockout_start_min >= 1440 || cfg->lockout_end_min >= 1440) return "lockout_time";
+    if (cfg->wifi_ssid[sizeof(cfg->wifi_ssid) - 1] != '\0') return "wifi_ssid_terminated";
+    if (cfg->wifi_pass[sizeof(cfg->wifi_pass) - 1] != '\0') return "wifi_pass_terminated";
+    if (cfg->mqtt_host[sizeof(cfg->mqtt_host) - 1] != '\0') return "mqtt_host_terminated";
+    if (cfg->mqtt_user[sizeof(cfg->mqtt_user) - 1] != '\0') return "mqtt_user_terminated";
+    if (cfg->mqtt_pass[sizeof(cfg->mqtt_pass) - 1] != '\0') return "mqtt_pass_terminated";
+    if (cfg->mqtt_topic[sizeof(cfg->mqtt_topic) - 1] != '\0') return "mqtt_topic_terminated";
+    return NULL;
+}
+
 /* live telemetry (updated by control task) */
 static int16_t g_depth_cm = 0;
 static int16_t g_baro_pressure_hpa = -1;
 static int16_t g_tank_pressure_hpa = -1;
 static int32_t g_baro_pressure_hpa_x100 = -1;
 static int32_t g_tank_pressure_hpa_x100 = -1;
+static int16_t g_external_temp_c_x100 = INT16_MIN;
+static int16_t g_water_temp_c_x100 = INT16_MIN;
 static uint8_t g_level_pct = 0;
 static uint8_t g_fault     = 0;
 static uint8_t g_low_alert = 0;
+static uint8_t g_lockout_active = 0;
+static uint8_t g_time_valid = 0;
 static bool    g_relay_on  = false;
 static volatile bool g_zb_joined = false;   /* true once on a Zigbee network */
 static volatile int64_t g_join_us = 0;      /* timestamp (us) when we joined   */
@@ -129,41 +172,37 @@ static volatile bool s_mqtt_connected = false;
 static char s_mqtt_uri[96];
 static httpd_handle_t s_httpd = NULL;
 static int s_wifi_retry = 0;
+static volatile bool s_wifi_started = false;
+static volatile bool s_setup_portal_active = false;
 
 /* ----------------------------- NVS persistence -------------------------- */
 static void cfg_load(void)
 {
     nvs_handle_t h;
     if (nvs_open("tank", NVS_READONLY, &h) != ESP_OK) return;
-    size_t sz = sizeof(g_cfg);
-    esp_err_t err = nvs_get_blob(h, "cfg", &g_cfg, &sz);
+    size_t sz = 0;
+    esp_err_t err = nvs_get_blob(h, "cfg", NULL, &sz);
+    bool migrated = false;
+    if (err == ESP_OK && sz <= sizeof(g_cfg)) {
+        g_cfg = DEFAULT_CFG;
+        err = nvs_get_blob(h, "cfg", &g_cfg, &sz);
+        if (err == ESP_OK && g_cfg.version == 4) {
+            g_cfg.version = DEFAULT_CFG.version;
+            g_cfg.lockout_enabled = 0;
+            g_cfg.lockout_start_min = DEFAULT_LOCKOUT_START_MIN;
+            g_cfg.lockout_end_min = DEFAULT_LOCKOUT_END_MIN;
+            migrated = true;
+        }
+    }
     nvs_close(h);
 
-    bool bad = err != ESP_OK
-        || sz != sizeof(g_cfg)
-        || g_cfg.magic != DEFAULT_CFG.magic
-        || g_cfg.version != DEFAULT_CFG.version
-        || g_cfg.calibrated > 1
-        || g_cfg.low_cm < 0
-        || g_cfg.operating_cm < 0
-        || g_cfg.operating_cm < g_cfg.low_cm
-        || g_cfg.full_cm <= g_cfg.operating_cm
-        || g_cfg.tank_h_cm < 10
-        || g_cfg.tank_h_cm > 1000
-        || g_cfg.full_cm > g_cfg.tank_h_cm + MAX_DEPTH_OVER_TANK_CM
-        || g_cfg.density < 900
-        || g_cfg.density > 1100
-        || g_cfg.mode > MODE_OFF
-        || (g_cfg.conn_mode != CONN_UNSET && g_cfg.conn_mode > CONN_WIFI)
-        || g_cfg.wifi_ssid[sizeof(g_cfg.wifi_ssid) - 1] != '\0'
-        || g_cfg.wifi_pass[sizeof(g_cfg.wifi_pass) - 1] != '\0'
-        || g_cfg.mqtt_host[sizeof(g_cfg.mqtt_host) - 1] != '\0'
-        || g_cfg.mqtt_user[sizeof(g_cfg.mqtt_user) - 1] != '\0'
-        || g_cfg.mqtt_pass[sizeof(g_cfg.mqtt_pass) - 1] != '\0'
-        || g_cfg.mqtt_topic[sizeof(g_cfg.mqtt_topic) - 1] != '\0';
+    const char *bad = (err != ESP_OK || sz > sizeof(g_cfg)) ? "nvs_blob" : cfg_validate(&g_cfg, false);
     if (bad) {
-        ESP_LOGW(TAG, "stored config invalid, restoring defaults");
+        ESP_LOGW(TAG, "stored config invalid (%s), restoring defaults", bad);
         g_cfg = DEFAULT_CFG;
+        cfg_save();
+    } else if (migrated) {
+        ESP_LOGI(TAG, "stored config migrated to version %u", DEFAULT_CFG.version);
         cfg_save();
     }
 }
@@ -214,6 +253,88 @@ static int form_int(const char *form, const char *key, int fallback)
     return fallback;
 }
 
+static void json_escape_str(const char *src, char *dst, size_t dst_len)
+{
+    if (dst_len == 0) return;
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && o + 1 < dst_len; p++) {
+        if ((*p == '"' || *p == '\\') && o + 2 < dst_len) {
+            dst[o++] = '\\';
+            dst[o++] = (char)*p;
+        } else if (*p >= 0x20) {
+            dst[o++] = (char)*p;
+        }
+    }
+    dst[o] = '\0';
+}
+
+static esp_err_t read_request_body(httpd_req_t *req, char *buf, size_t buf_len)
+{
+    if (buf_len == 0) return ESP_ERR_INVALID_SIZE;
+    if (req->content_len >= buf_len) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t off = 0;
+    while (off < req->content_len) {
+        int got = httpd_req_recv(req, buf + off, req->content_len - off);
+        if (got <= 0) return ESP_FAIL;
+        off += (size_t)got;
+    }
+    buf[off] = '\0';
+    return ESP_OK;
+}
+
+static bool local_time_minutes(uint16_t *minute_of_day)
+{
+    time_t now = time(NULL);
+    if (now < 1704067200) { /* 2024-01-01 UTC: before this, SNTP/RTC is not sane */
+        g_time_valid = 0;
+        return false;
+    }
+    struct tm local;
+    localtime_r(&now, &local);
+    *minute_of_day = (uint16_t)(local.tm_hour * 60 + local.tm_min);
+    g_time_valid = 1;
+    return true;
+}
+
+static bool minute_in_window(uint16_t minute, uint16_t start, uint16_t end)
+{
+    if (start == end) return false;
+    if (start < end) return minute >= start && minute < end;
+    return minute >= start || minute < end;
+}
+
+static bool lockout_is_active(const cfg_t *cfg)
+{
+    if (!cfg->lockout_enabled) {
+        g_lockout_active = 0;
+        if (cfg->conn_mode == CONN_WIFI) {
+            uint16_t minute = 0;
+            (void)local_time_minutes(&minute);
+        } else {
+            g_time_valid = 0;
+        }
+        return false;
+    }
+
+    if (cfg->conn_mode == CONN_WIFI) {
+        uint16_t minute = 0;
+        if (!local_time_minutes(&minute)) {
+            g_lockout_active = 1; /* safe fallback: no clock, no automatic pump run */
+            return true;
+        }
+        g_lockout_active = minute_in_window(minute, cfg->lockout_start_min, cfg->lockout_end_min) ? 1 : 0;
+        return g_lockout_active != 0;
+    }
+
+    /* Zigbee/Home Assistant mode: the coordinator sets this directly. */
+    g_time_valid = 0;
+    g_lockout_active = 1;
+    return true;
+}
+
 static void mqtt_publish_state(void)
 {
     if (!s_mqtt || !s_mqtt_connected) return;
@@ -224,16 +345,23 @@ static void mqtt_publish_state(void)
     xSemaphoreGive(g_cfg_mtx);
 
     char topic[64];
-    char payload[384];
+    char payload[560];
     snprintf(topic, sizeof(topic), "%s/state", cfg.mqtt_topic[0] ? cfg.mqtt_topic : DEFAULT_MQTT_TOPIC);
     int n = snprintf(payload, sizeof(payload),
         "{\"depth_cm\":%d,\"level_pct\":%u,\"fault\":%u,\"low_alert\":%u,"
         "\"relay\":%s,\"mode\":%u,\"low_cm\":%d,\"operating_cm\":%d,\"full_cm\":%d,"
-        "\"baro_hpa\":%.2f,\"tank_hpa\":%.2f}",
+        "\"lockout_enabled\":%u,\"lockout_start_min\":%u,\"lockout_end_min\":%u,"
+        "\"lockout_active\":%u,\"time_valid\":%u,"
+        "\"baro_hpa\":%.2f,\"tank_hpa\":%.2f,\"external_temp_c\":%.2f,\"water_temp_c\":%.2f}",
         g_depth_cm, g_level_pct, g_fault, g_low_alert, g_relay_on ? "true" : "false",
         cfg.mode, cfg.low_cm, cfg.operating_cm, cfg.full_cm,
+        cfg.lockout_enabled, cfg.lockout_start_min, cfg.lockout_end_min, g_lockout_active, g_time_valid,
         g_baro_pressure_hpa_x100 >= 0 ? (double)g_baro_pressure_hpa_x100 / 100.0 : -1.0,
-        g_tank_pressure_hpa_x100 >= 0 ? (double)g_tank_pressure_hpa_x100 / 100.0 : -1.0);
+        g_tank_pressure_hpa_x100 >= 0 ? (double)g_tank_pressure_hpa_x100 / 100.0 : -1.0,
+        g_external_temp_c_x100 != INT16_MIN ? (double)g_external_temp_c_x100 / 100.0 : -99.99,
+        g_water_temp_c_x100 != INT16_MIN ? (double)g_water_temp_c_x100 / 100.0 : -99.99);
+    if (n < 0) return;
+    if (n >= (int)sizeof(payload)) n = strlen(payload);
     esp_mqtt_client_publish(s_mqtt, topic, payload, n, 0, 0);
 }
 
@@ -277,10 +405,16 @@ static void mqtt_apply_command(const char *payload, int len)
     if (json_has(json, "low_cm", val, sizeof(val))) cfg.low_cm = atoi(val);
     if (json_has(json, "operating_cm", val, sizeof(val))) cfg.operating_cm = atoi(val);
     if (json_has(json, "full_cm", val, sizeof(val))) cfg.full_cm = atoi(val);
+    if (json_has(json, "pump_lockout", val, sizeof(val)) ||
+        json_has(json, "lockout_enabled", val, sizeof(val))) {
+        cfg.lockout_enabled = (strcmp(val, "true") == 0 || strcmp(val, "on") == 0 || atoi(val) != 0) ? 1 : 0;
+    }
+    if (json_has(json, "lockout_start_min", val, sizeof(val))) cfg.lockout_start_min = atoi(val);
+    if (json_has(json, "lockout_end_min", val, sizeof(val))) cfg.lockout_end_min = atoi(val);
 
-    if (cfg.low_cm < 0 || cfg.operating_cm < cfg.low_cm || cfg.full_cm <= cfg.operating_cm ||
-        cfg.mode > MODE_OFF) {
-        ESP_LOGW(TAG, "MQTT command rejected: %s", json);
+    const char *bad = cfg_validate(&cfg, false);
+    if (bad) {
+        ESP_LOGW(TAG, "MQTT command rejected (%s): %s", bad, json);
         return;
     }
 
@@ -289,10 +423,13 @@ static void mqtt_apply_command(const char *payload, int len)
     g_cfg.operating_cm = cfg.operating_cm;
     g_cfg.full_cm = cfg.full_cm;
     g_cfg.mode = cfg.mode;
+    g_cfg.lockout_enabled = cfg.lockout_enabled;
+    g_cfg.lockout_start_min = cfg.lockout_start_min;
+    g_cfg.lockout_end_min = cfg.lockout_end_min;
     xSemaphoreGive(g_cfg_mtx);
     cfg_save();
-    ESP_LOGI(TAG, "MQTT cfg: lowAlert=%d operating=%d full=%d mode=%u",
-             cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.mode);
+    ESP_LOGI(TAG, "MQTT cfg: lowAlert=%d operating=%d full=%d mode=%u lockout=%u",
+             cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.mode, cfg.lockout_enabled);
     mqtt_publish_state();
 }
 
@@ -476,6 +613,14 @@ static void zb_push_telemetry(void)
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_BARO_PRESSURE_HPA, &g_baro_pressure_hpa, true);
     err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TANK_PRESSURE_HPA, &g_tank_pressure_hpa, true);
+    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_EXTERNAL_TEMP_CX100, &g_external_temp_c_x100, true);
+    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_WATER_TEMP_CX100, &g_water_temp_c_x100, true);
+    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LOCKOUT_ACTIVE, &g_lockout_active, true);
+    err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TIME_VALID, &g_time_valid, true);
 
     uint8_t on = g_relay_on ? 1 : 0;
     err |= esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
@@ -515,20 +660,37 @@ static esp_err_t setup_status_get(httpd_req_t *req)
     cfg = g_cfg;
     xSemaphoreGive(g_cfg_mtx);
 
-    char json[980];
+    char wifi_ssid[sizeof(cfg.wifi_ssid) * 2];
+    char mqtt_host[sizeof(cfg.mqtt_host) * 2];
+    char mqtt_user[sizeof(cfg.mqtt_user) * 2];
+    char mqtt_topic[sizeof(cfg.mqtt_topic) * 2];
+    json_escape_str(cfg.wifi_ssid, wifi_ssid, sizeof(wifi_ssid));
+    json_escape_str(cfg.mqtt_host, mqtt_host, sizeof(mqtt_host));
+    json_escape_str(cfg.mqtt_user, mqtt_user, sizeof(mqtt_user));
+    json_escape_str(cfg.mqtt_topic, mqtt_topic, sizeof(mqtt_topic));
+
+    char json[1220];
     int n = snprintf(json, sizeof(json),
-        "{\"baro_hpa\":%.2f,\"tank_hpa\":%.2f,\"depth_cm\":%d,\"level_pct\":%u,"
+        "{\"baro_hpa\":%.2f,\"tank_hpa\":%.2f,\"external_temp_c\":%.2f,\"water_temp_c\":%.2f,"
+        "\"depth_cm\":%d,\"level_pct\":%u,"
         "\"fault\":%u,\"low_alert\":%u,\"relay\":%s,\"calibrated\":%u,\"air_offset_hpa\":%.2f,"
         "\"low_cm\":%d,\"operating_cm\":%d,\"full_cm\":%d,\"tank_height_cm\":%d,\"density\":%u,"
-        "\"mode\":%u,\"conn_mode\":%u,\"wifi_connected\":%s,\"mqtt_connected\":%s,"
+        "\"mode\":%u,\"conn_mode\":%u,\"lockout_enabled\":%u,\"lockout_start_min\":%u,"
+        "\"lockout_end_min\":%u,\"lockout_active\":%u,\"time_valid\":%u,"
+        "\"wifi_connected\":%s,\"mqtt_connected\":%s,"
         "\"wifi_ssid\":\"%s\",\"mqtt_host\":\"%s\",\"mqtt_user\":\"%s\",\"mqtt_topic\":\"%s\"}",
         g_baro_pressure_hpa_x100 >= 0 ? (double)g_baro_pressure_hpa_x100 / 100.0 : -1.0,
         g_tank_pressure_hpa_x100 >= 0 ? (double)g_tank_pressure_hpa_x100 / 100.0 : -1.0,
+        g_external_temp_c_x100 != INT16_MIN ? (double)g_external_temp_c_x100 / 100.0 : -99.99,
+        g_water_temp_c_x100 != INT16_MIN ? (double)g_water_temp_c_x100 / 100.0 : -99.99,
         g_depth_cm, g_level_pct, g_fault, g_low_alert, g_relay_on ? "true" : "false",
         cfg.calibrated, (double)cfg.air_offset_hpa_x100 / 100.0,
         cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.tank_h_cm, cfg.density, cfg.mode, cfg.conn_mode,
+        cfg.lockout_enabled, cfg.lockout_start_min, cfg.lockout_end_min, g_lockout_active, g_time_valid,
         s_wifi_connected ? "true" : "false", s_mqtt_connected ? "true" : "false",
-        cfg.wifi_ssid, cfg.mqtt_host, cfg.mqtt_user, cfg.mqtt_topic);
+        wifi_ssid, mqtt_host, mqtt_user, mqtt_topic);
+    if (n < 0) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Status format failed");
+    if (n >= (int)sizeof(json)) n = strlen(json);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, json, n);
 }
@@ -546,8 +708,10 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "</style></head><body><main><h1>Tank Controller Setup</h1>"
         "<section><h2>Live Sensor Check</h2><div class=grid>"
         "<div class=v>Baro <b id=baro>-</b> hPa</div><div class=v>Tank <b id=tank>-</b> hPa</div>"
+        "<div class=v>External <b id=exttemp>-</b> C</div><div class=v>Water <b id=watertemp>-</b> C</div>"
         "<div class=v>Depth <b id=depth>-</b> cm</div><div class=v>Low alert <b id=lowalert>-</b></div>"
         "<div class=v>Relay <b id=relay>-</b></div><div class=v>Fault <b id=fault>-</b></div>"
+        "<div class=v>Lockout <b id=lockstat>-</b></div><div class=v>Clock <b id=clockstat>-</b></div>"
         "<div class=v>WiFi <b id=wifistat>-</b></div><div class=v>MQTT <b id=mqttstat>-</b></div>"
         "</div><p id=cal></p></section>"
         "<section><h2>1. Open-Air Test</h2><p>Keep both sensors in open air, then save the offset.</p><button onclick=\"post('/api/open_air')\">Run open-air test</button></section>"
@@ -557,7 +721,9 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "<label>Full level cm<input id=full type=number></label>"
         "<label>Tank height cm<input id=height type=number></label><label>Density kg/m3<input id=density type=number></label>"
         "<label>Mode<select id=mode><option value=0>auto</option><option value=1>force on</option><option value=2>force off</option></select></label>"
-        "<label>Connectivity<select id=conn><option value=255>choose</option><option value=0>AP</option><option value=1>zigbee</option><option value=2>local wifi</option></select></label>"
+        "<label>Connectivity<select id=conn><option value=255>choose</option><option value=0>standalone</option><option value=1>zigbee</option><option value=2>local wifi</option></select></label>"
+        "<label>Pump lockout<select id=lock><option value=0>off</option><option value=1>on / scheduled</option></select></label>"
+        "<label>Lockout start min<input id=lstart type=number min=0 max=1439></label><label>Lockout end min<input id=lend type=number min=0 max=1439></label>"
         "</div></section><section id=wifisec><h2>Local WiFi / MQTT</h2><div class=row>"
         "<label>WiFi SSID<input id=ssid></label><label>WiFi password<input id=wpass type=password autocomplete=off></label>"
         "<label>MQTT broker IP/host<input id=mh placeholder='192.168.1.10'></label><label>MQTT topic<input id=mt></label>"
@@ -569,13 +735,15 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "const $=id=>document.getElementById(id);"
         "let changed=new Set();let formInit=false;"
         "function toggleWifi(){var c=$('conn').value;$('wifisec').style.display=(c=='2')?'':'none';"
-        "$('connhint').textContent=(c=='1')?'Zigbee selected - Save & reboot to leave setup and join your Zigbee network.':(c=='2')?'Local WiFi selected - fill in WiFi/MQTT above, then Save & reboot.':(c=='0')?'AP/setup mode stays active after reboot.':'Choose a connectivity option, then Save & reboot.'}"
-        "function bindEdits(){['low','op','full','height','density','mode','conn','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>changed.add(id);$(id).onchange=()=>changed.add(id)});$('conn').addEventListener('change',toggleWifi)}"
-        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';toggleWifi();changed.clear()}"
+        "$('connhint').textContent=(c=='1')?'Zigbee selected - Save & reboot to leave setup and join your Zigbee network.':(c=='2')?'Local WiFi selected - fill in WiFi/MQTT above, then Save & reboot.':(c=='0')?'Standalone selected - Save & reboot to run locally with no WiFi AP.':'Choose a connectivity option, then Save & reboot.'}"
+        "function bindEdits(){['low','op','full','height','density','mode','conn','lock','lstart','lend','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>changed.add(id);$(id).onchange=()=>changed.add(id)});$('conn').addEventListener('change',toggleWifi)}"
+        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('lock').value=s.lockout_enabled;$('lstart').value=s.lockout_start_min;$('lend').value=s.lockout_end_min;$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';toggleWifi();changed.clear()}"
         "async function refresh(){let s=await(await fetch('/api/status')).json();syncForm(s)}"
         "async function load(){let r=await fetch('/api/status');let s=await r.json();"
         "$('baro').textContent=s.baro_hpa.toFixed(2);$('tank').textContent=s.tank_hpa.toFixed(2);$('depth').textContent=s.depth_cm;$('fault').textContent=s.fault;"
+        "$('exttemp').textContent=s.external_temp_c.toFixed(2);$('watertemp').textContent=s.water_temp_c.toFixed(2);"
         "$('lowalert').textContent=s.low_alert?'ON':'OFF';$('relay').textContent=s.relay?'ON':'OFF';"
+        "$('lockstat').textContent=s.lockout_active?'ON':'off';$('clockstat').textContent=s.time_valid?'synced':'not synced';"
         "$('wifistat').textContent=s.wifi_connected?'connected':'off';$('mqttstat').textContent=s.mqtt_connected?'connected':'off';"
         "$('cal').innerHTML=s.calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';"
         "if(!formInit){syncForm(s);formInit=true}}"
@@ -643,9 +811,13 @@ static esp_err_t setup_config_post(httpd_req_t *req)
 
     char form[900] = "";
     if (req->content_len > 0) {
-        int got = httpd_req_recv(req, form, sizeof(form) - 1);
-        if (got <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing form body");
-        form[got] = '\0';
+        esp_err_t err = read_request_body(req, form, sizeof(form));
+        if (err == ESP_ERR_INVALID_SIZE) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Form body too large");
+        }
+        if (err != ESP_OK) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing form body");
+        }
     } else if (httpd_req_get_url_query_str(req, form, sizeof(form)) != ESP_OK) {
         form[0] = '\0';
     }
@@ -657,6 +829,9 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     cfg.density = form_int(form, "density", cfg.density);
     cfg.mode = form_int(form, "mode", cfg.mode);
     cfg.conn_mode = form_int(form, "conn", cfg.conn_mode);
+    cfg.lockout_enabled = form_int(form, "lock", cfg.lockout_enabled) ? 1 : 0;
+    cfg.lockout_start_min = form_int(form, "lstart", cfg.lockout_start_min);
+    cfg.lockout_end_min = form_int(form, "lend", cfg.lockout_end_min);
     copy_form_str(form, "ssid", cfg.wifi_ssid, sizeof(cfg.wifi_ssid));
     copy_form_str(form, "mh", cfg.mqtt_host, sizeof(cfg.mqtt_host));
     copy_form_str(form, "mu", cfg.mqtt_user, sizeof(cfg.mqtt_user));
@@ -669,14 +844,11 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     if (maybe_pass[0]) strlcpy(cfg.mqtt_pass, maybe_pass, sizeof(cfg.mqtt_pass));
     if (!cfg.mqtt_topic[0]) strlcpy(cfg.mqtt_topic, DEFAULT_MQTT_TOPIC, sizeof(cfg.mqtt_topic));
 
-    if (cfg.low_cm < 0 || cfg.operating_cm < 0 || cfg.operating_cm < cfg.low_cm ||
-        cfg.full_cm <= cfg.operating_cm ||
-        cfg.tank_h_cm < 10 ||
-        cfg.full_cm > cfg.tank_h_cm + MAX_DEPTH_OVER_TANK_CM || cfg.density < 900 ||
-        cfg.density > 1100 || cfg.mode > MODE_OFF ||
-        (cfg.conn_mode != CONN_UNSET && cfg.conn_mode > CONN_WIFI) ||
-        (cfg.conn_mode == CONN_WIFI && !cfg.wifi_ssid[0])) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid parameter range");
+    const char *bad = cfg_validate(&cfg, true);
+    if (bad) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "Invalid parameter range: %s", bad);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
     }
 
     xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
@@ -684,8 +856,9 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     xSemaphoreGive(g_cfg_mtx);
     cfg_save();
     zb_push_mode(cfg.mode);
-    ESP_LOGI(TAG, "setup save: lowAlert=%d operating=%d full=%d conn=%u mode=%u",
-             cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.conn_mode, cfg.mode);
+    ESP_LOGI(TAG, "setup save: lowAlert=%d operating=%d full=%d conn=%u mode=%u lockout=%u %u-%u",
+             cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.conn_mode, cfg.mode,
+             cfg.lockout_enabled, cfg.lockout_start_min, cfg.lockout_end_min);
     return httpd_resp_sendstr(req, "Parameters saved");
 }
 
@@ -717,8 +890,28 @@ static void web_server_start(void)
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/reboot", .method=HTTP_POST, .handler=setup_reboot_post });
 }
 
+static void time_sync_start(void)
+{
+    setenv("TZ", "CAT-2", 1); /* Africa/Harare: UTC+2, no DST */
+    tzset();
+    if (esp_sntp_enabled()) return;
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP time sync started");
+}
+
 static void setup_portal_start(void)
 {
+    if (s_setup_portal_active) {
+        ESP_LOGI(TAG, "setup AP already active");
+        return;
+    }
+    if (s_wifi_started) {
+        ESP_LOGW(TAG, "setup AP request ignored: WiFi station is already running");
+        return;
+    }
+
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(err);
     err = esp_event_loop_create_default();
@@ -727,6 +920,7 @@ static void setup_portal_start(void)
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+    s_wifi_started = true;
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
@@ -742,6 +936,7 @@ static void setup_portal_start(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     web_server_start();
+    s_setup_portal_active = true;
 
     ESP_LOGI(TAG, "setup AP started: SSID=%s URL=http://192.168.4.1", ap_cfg.ap.ssid);
 }
@@ -788,6 +983,7 @@ static bool wifi_station_start(void)
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+    s_wifi_started = true;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
 
@@ -812,43 +1008,16 @@ static bool wifi_station_start(void)
         ESP_LOGE(TAG, "WiFi connection timed out; falling back to setup AP");
         esp_wifi_stop();
         esp_wifi_deinit();
+        s_wifi_started = false;
         return false;
     }
 
+    time_sync_start();
     web_server_start();
     mqtt_start();
     return true;
 }
 
-static bool setup_boot_button_held(void)
-{
-    gpio_config_t io = {
-        .pin_bit_mask = 1ULL << BUTTON_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io);
-
-    int64_t deadline = esp_timer_get_time() + (int64_t)SETUP_BOOT_WINDOW_MS * 1000;
-    int64_t down_since = 0;
-    while (esp_timer_get_time() < deadline) {
-        bool down = gpio_get_level(BUTTON_GPIO) == 0;
-        if (down) {
-            if (down_since == 0) {
-                down_since = esp_timer_get_time();
-            } else if (esp_timer_get_time() - down_since >= (int64_t)SETUP_BOOT_HOLD_MS * 1000) {
-                ESP_LOGW(TAG, "BOOT held during startup -> setup AP mode");
-                return true;
-            }
-        } else {
-            down_since = 0;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    return false;
-}
 #endif
 
 /* Full factory reset: wipe our saved config (-> conn_mode UNSET, so it boots into
@@ -882,7 +1051,7 @@ static void factory_reset(void)
 
 /* ----------------------------- button task ------------------------------ */
 /* runs in ALL modes. short press: cycle AUTO -> FORCE_ON -> FORCE_OFF -> AUTO.
- * long press (>= BUTTON_LONGPRESS_MS): full factory reset (config + Zigbee). */
+ * service hold: temporary setup AP. full hold: factory reset (config + Zigbee). */
 static void button_task(void *arg)
 {
     gpio_config_t io = {
@@ -894,13 +1063,14 @@ static void button_task(void *arg)
     };
     gpio_config(&io);
 
-    /* If BOOT is still held from startup (used to enter the setup AP), wait for
-     * release first so it isn't mistaken for a runtime long-press reset. */
+    /* If BOOT is still held from startup, wait for release first so it isn't
+     * mistaken for a runtime service/reset hold. */
     while (gpio_get_level(BUTTON_GPIO) == 0) vTaskDelay(pdMS_TO_TICKS(20));
 
     bool prev_down = false;
     int64_t press_us = 0;
-    bool long_fired = false;
+    bool service_fired = false;
+    bool reset_fired = false;
 
     while (1) {
         bool down = (gpio_get_level(BUTTON_GPIO) == 0);   /* active low */
@@ -908,13 +1078,23 @@ static void button_task(void *arg)
 
         if (down && !prev_down) {
             press_us = now;
-            long_fired = false;
-        } else if (down && !long_fired &&
-                   (now - press_us) >= (int64_t)BUTTON_LONGPRESS_MS * 1000) {
-            ESP_LOGW(TAG, "long press -> full factory reset");
-            long_fired = true;
+            service_fired = false;
+            reset_fired = false;
+        } else if (down && !service_fired &&
+                   (now - press_us) >= (int64_t)BUTTON_SERVICE_AP_MS * 1000) {
+#if SETUP_PORTAL_ENABLE
+            ESP_LOGW(TAG, "service hold -> temporary setup AP");
+            setup_portal_start();
+#else
+            ESP_LOGW(TAG, "service hold ignored: setup portal disabled");
+#endif
+            service_fired = true;
+        } else if (down && !reset_fired &&
+                   (now - press_us) >= (int64_t)BUTTON_FACTORY_RESET_MS * 1000) {
+            ESP_LOGW(TAG, "factory reset hold -> full factory reset");
+            reset_fired = true;
             factory_reset();                 /* clears config + Zigbee, reboots */
-        } else if (!down && prev_down && !long_fired) {
+        } else if (!down && prev_down && !service_fired && !reset_fired) {
             if ((now - press_us) >= (int64_t)BUTTON_DEBOUNCE_MS * 1000) {
                 uint8_t m;
                 xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
@@ -982,27 +1162,39 @@ static void control_task(void *arg)
         /* read whichever sensors are present (each independent), averaging a
          * few slow one-shot conversions to calm long wires and startup noise. */
         float p_tank = 0, p_baro = 0;
+        float t_tank = 0, t_baro = 0;
         int baro_n = 0, tank_n = 0;
         for (int i = 0; i < SENSOR_AVG_SAMPLES; i++) {
             float p = 0;
-            if (baro_ok && lps2x_read(&baro, &p, NULL) == ESP_OK) {
+            float t = 0;
+            if (baro_ok && lps2x_read(&baro, &p, &t) == ESP_OK) {
                 p_baro += p;
+                t_baro += t;
                 baro_n++;
             }
-            if (tank_ok && lps2x_read(&tank, &p, NULL) == ESP_OK) {
+            if (tank_ok && lps2x_read(&tank, &p, &t) == ESP_OK) {
                 p_tank += p;
+                t_tank += t;
                 tank_n++;
             }
             if (i + 1 < SENSOR_AVG_SAMPLES) vTaskDelay(pdMS_TO_TICKS(SENSOR_AVG_DELAY_MS));
         }
         bool baro_rd = baro_n > 0;
         bool tank_rd = tank_n > 0;
-        if (baro_rd) p_baro /= (float)baro_n;
-        if (tank_rd) p_tank /= (float)tank_n;
+        if (baro_rd) {
+            p_baro /= (float)baro_n;
+            t_baro /= (float)baro_n;
+        }
+        if (tank_rd) {
+            p_tank /= (float)tank_n;
+            t_tank /= (float)tank_n;
+        }
         g_baro_pressure_hpa = baro_rd ? (int16_t)lroundf(p_baro) : -1;
         g_tank_pressure_hpa = tank_rd ? (int16_t)lroundf(p_tank) : -1;
         g_baro_pressure_hpa_x100 = baro_rd ? (int32_t)lroundf(p_baro * 100.0f) : -1;
         g_tank_pressure_hpa_x100 = tank_rd ? (int32_t)lroundf(p_tank * 100.0f) : -1;
+        g_external_temp_c_x100 = baro_rd ? (int16_t)lroundf(t_baro * 100.0f) : INT16_MIN;
+        g_water_temp_c_x100 = tank_rd ? (int16_t)lroundf(t_tank * 100.0f) : INT16_MIN;
         bool level_ok = false;     /* true only when a real water level is known */
 
         if (baro_rd && tank_rd) {
@@ -1035,9 +1227,9 @@ static void control_task(void *arg)
             g_low_alert = (level_ok && g_depth_cm <= cfg.low_cm) ? 1 : 0;
             fault_count = 0;
 #if LOG_SENSOR_READINGS
-            ESP_LOGI(TAG, "sensor read: baro=%.2fhPa(%d/%d) tank=%.2fhPa(%d/%d) depth=%dcm level=%u%% fault=%u",
-                     p_baro, baro_n, SENSOR_AVG_SAMPLES,
-                     p_tank, tank_n, SENSOR_AVG_SAMPLES,
+            ESP_LOGI(TAG, "sensor read: baro=%.2fhPa %.2fC(%d/%d) tank=%.2fhPa %.2fC(%d/%d) depth=%dcm level=%u%% fault=%u",
+                     p_baro, t_baro, baro_n, SENSOR_AVG_SAMPLES,
+                     p_tank, t_tank, tank_n, SENSOR_AVG_SAMPLES,
                      g_depth_cm, g_level_pct, g_fault);
 #endif
         } else if (baro_rd || tank_rd) {
@@ -1051,8 +1243,9 @@ static void control_task(void *arg)
             g_low_alert = 0;
             fault_count = 0;
 #if LOG_SENSOR_READINGS
-            ESP_LOGW(TAG, "sensor read: only %s OK, pressure=%.2fhPa",
-                     baro_rd ? "baro" : "tank", baro_rd ? p_baro : p_tank);
+            ESP_LOGW(TAG, "sensor read: only %s OK, pressure=%.2fhPa temp=%.2fC",
+                     baro_rd ? "baro" : "tank", baro_rd ? p_baro : p_tank,
+                     baro_rd ? t_baro : t_tank);
 #endif
         } else {
             if (++fault_count >= SENSOR_FAULT_LIMIT) g_fault = 1;
@@ -1083,6 +1276,11 @@ static void control_task(void *arg)
 #endif
         }
 
+        bool locked_out = lockout_is_active(&cfg);
+        if (cfg.mode == MODE_AUTO && locked_out) {
+            want = false;
+        }
+
         /* anti-short-cycle guards (only when actually pump-controlling) */
         if (cfg.mode == MODE_AUTO && level_ok) {
             if (want && !g_relay_on) {
@@ -1096,8 +1294,8 @@ static void control_task(void *arg)
         if (want != g_relay_on) {
             relay_set(want);
             if (want) last_on_us = now; else last_off_us = now;
-            ESP_LOGI(TAG, "relay -> %s (depth=%dcm %d%% mode=%d fault=%d)",
-                     want ? "ON" : "OFF", g_depth_cm, g_level_pct, cfg.mode, g_fault);
+            ESP_LOGI(TAG, "relay -> %s (depth=%dcm %d%% mode=%d fault=%d lockout=%u)",
+                     want ? "ON" : "OFF", g_depth_cm, g_level_pct, cfg.mode, g_fault, g_lockout_active);
         }
 
         zb_push_telemetry();
@@ -1209,21 +1407,32 @@ static esp_err_t zb_set_attr_cb(const esp_zb_zcl_set_attr_value_message_t *m)
     if (m->info.cluster != ZB_CUSTOM_CLUSTER_ID) return ESP_OK;
 
     xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg_t next = g_cfg;
     switch (m->attribute.id) {
-        case ATTR_SET_LOW_CM:     g_cfg.low_cm    = *(int16_t *)m->attribute.data.value; break;
-        case ATTR_SET_FULL_CM:    g_cfg.full_cm   = *(int16_t *)m->attribute.data.value; break;
-        case ATTR_TANK_HEIGHT_CM: g_cfg.tank_h_cm = *(int16_t *)m->attribute.data.value; break;
-        case ATTR_DENSITY:        g_cfg.density   = *(uint16_t *)m->attribute.data.value; break;
-        case ATTR_MODE:           g_cfg.mode      = *(uint8_t *)m->attribute.data.value; break;
-        case ATTR_OPERATING_CM:   g_cfg.operating_cm = *(int16_t *)m->attribute.data.value; break;
+        case ATTR_SET_LOW_CM:     next.low_cm    = *(int16_t *)m->attribute.data.value; break;
+        case ATTR_SET_FULL_CM:    next.full_cm   = *(int16_t *)m->attribute.data.value; break;
+        case ATTR_TANK_HEIGHT_CM: next.tank_h_cm = *(int16_t *)m->attribute.data.value; break;
+        case ATTR_DENSITY:        next.density   = *(uint16_t *)m->attribute.data.value; break;
+        case ATTR_MODE:           next.mode      = *(uint8_t *)m->attribute.data.value; break;
+        case ATTR_OPERATING_CM:   next.operating_cm = *(int16_t *)m->attribute.data.value; break;
+        case ATTR_LOCKOUT_ENABLED:next.lockout_enabled = *(uint8_t *)m->attribute.data.value ? 1 : 0; break;
+        case ATTR_LOCKOUT_START_MIN: next.lockout_start_min = *(uint16_t *)m->attribute.data.value; break;
+        case ATTR_LOCKOUT_END_MIN:   next.lockout_end_min = *(uint16_t *)m->attribute.data.value; break;
         default: break;
+    }
+    const char *bad = cfg_validate(&next, false);
+    if (bad) {
+        ESP_LOGW(TAG, "Zigbee cfg update rejected (%s): attr=0x%04x", bad, m->attribute.id);
+    } else {
+        g_cfg = next;
     }
     cfg_t snap = g_cfg;
     xSemaphoreGive(g_cfg_mtx);
 
-    cfg_save();
-    ESP_LOGI(TAG, "cfg update: lowAlert=%d operating=%d full=%d tankH=%d rho=%d mode=%d",
-             snap.low_cm, snap.operating_cm, snap.full_cm, snap.tank_h_cm, snap.density, snap.mode);
+    if (!bad) cfg_save();
+    ESP_LOGI(TAG, "cfg update: lowAlert=%d operating=%d full=%d tankH=%d rho=%d mode=%d lockout=%u",
+             snap.low_cm, snap.operating_cm, snap.full_cm, snap.tank_h_cm, snap.density,
+             snap.mode, snap.lockout_enabled);
     return ESP_OK;
 }
 
@@ -1265,6 +1474,15 @@ static void add_custom_cluster(esp_zb_cluster_list_t *list)
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &s16);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_LOW_ALERT, ESP_ZB_ZCL_ATTR_TYPE_U8,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &u8);
+    s16 = INT16_MIN;
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_EXTERNAL_TEMP_CX100, ESP_ZB_ZCL_ATTR_TYPE_S16,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &s16);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_WATER_TEMP_CX100, ESP_ZB_ZCL_ATTR_TYPE_S16,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &s16);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_LOCKOUT_ACTIVE, ESP_ZB_ZCL_ATTR_TYPE_U8,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &u8);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_TIME_VALID, ESP_ZB_ZCL_ATTR_TYPE_U8,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &u8);
 
     /* config: read/write */
     s16 = g_cfg.low_cm;
@@ -1284,6 +1502,15 @@ static void add_custom_cluster(esp_zb_cluster_list_t *list)
     s16 = g_cfg.operating_cm;
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_OPERATING_CM, ESP_ZB_ZCL_ATTR_TYPE_S16,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &s16);
+    u8 = g_cfg.lockout_enabled;
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_LOCKOUT_ENABLED, ESP_ZB_ZCL_ATTR_TYPE_U8,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &u8);
+    u16 = g_cfg.lockout_start_min;
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_LOCKOUT_START_MIN, ESP_ZB_ZCL_ATTR_TYPE_U16,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &u16);
+    u16 = g_cfg.lockout_end_min;
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_LOCKOUT_END_MIN, ESP_ZB_ZCL_ATTR_TYPE_U16,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &u16);
 
     esp_zb_cluster_list_add_custom_cluster(list, c, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 }
@@ -1438,7 +1665,7 @@ void app_main(void)
     bool setup_mode = false;
     bool wifi_mode = false;
 #if SETUP_PORTAL_ENABLE
-    setup_mode = (g_cfg.conn_mode == CONN_UNSET) || (g_cfg.conn_mode == CONN_AP) || setup_boot_button_held();
+    setup_mode = (g_cfg.conn_mode == CONN_UNSET);
     if (setup_mode) {
         setup_portal_start();
     }

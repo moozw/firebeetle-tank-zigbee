@@ -19,9 +19,8 @@
 
 #define BUTTON_GPIO         28     /* onboard BOOT button, active-low (idle HIGH) */
 #define BUTTON_DEBOUNCE_MS  40
-#define BUTTON_LONGPRESS_MS 5000   /* >= this = Zigbee factory reset            */
-#define SETUP_BOOT_HOLD_MS  1500   /* hold BOOT during reset to start setup AP  */
-#define SETUP_BOOT_WINDOW_MS 5000  /* post-reset window to catch setup hold     */
+#define BUTTON_SERVICE_AP_MS 3000  /* hold while running: temporary setup AP    */
+#define BUTTON_FACTORY_RESET_MS 10000 /* hold while running: full factory reset */
 
 /* ---------- I2C addresses ---------- */
 /* Both Adafruit LPS2x boards power up on the same address. Current swapped
@@ -59,6 +58,8 @@
 #define BENCH_MAX_DELTA_HPA     10.0f  /* both sensors in air should be close    */
 #define PUMP_MIN_OFF_MS         30000  /* anti-short-cycle: min rest before re-ON */
 #define PUMP_MIN_ON_MS          0      /* optional min run time (0 = disabled)  */
+#define DEFAULT_LOCKOUT_START_MIN 1320 /* 22:00 local time */
+#define DEFAULT_LOCKOUT_END_MIN   300  /* 05:00 local time */
 #define LOG_SENSOR_READINGS     1      /* diagnostic serial log of pressure/depth */
 
 /* ---------- Local setup portal ---------- */
@@ -90,12 +91,19 @@
 #define ATTR_BARO_PRESSURE_HPA  0x0003  /* s16, read-only, reported   */
 #define ATTR_TANK_PRESSURE_HPA  0x0004  /* s16, read-only, reported   */
 #define ATTR_LOW_ALERT          0x0005  /* u8,  read-only, reported   */
+#define ATTR_EXTERNAL_TEMP_CX100 0x0006 /* s16, read-only, reported, degC x100 */
+#define ATTR_WATER_TEMP_CX100   0x0007  /* s16, read-only, reported, degC x100 */
 #define ATTR_SET_LOW_CM         0x0010  /* s16, read/write            */
 #define ATTR_SET_FULL_CM        0x0011  /* s16, read/write            */
 #define ATTR_TANK_HEIGHT_CM     0x0012  /* s16, read/write            */
 #define ATTR_DENSITY            0x0013  /* u16, read/write (kg/m^3)   */
 #define ATTR_MODE               0x0014  /* u8: 0=auto 1=force-on 2=force-off */
 #define ATTR_OPERATING_CM       0x0015  /* s16, read/write            */
+#define ATTR_LOCKOUT_ENABLED    0x0016  /* u8,  read/write            */
+#define ATTR_LOCKOUT_START_MIN  0x0017  /* u16, read/write minute of day */
+#define ATTR_LOCKOUT_END_MIN    0x0018  /* u16, read/write minute of day */
+#define ATTR_LOCKOUT_ACTIVE     0x0019  /* u8,  read-only, reported   */
+#define ATTR_TIME_VALID         0x001A  /* u8,  read-only, reported   */
 
 /* control modes */
 #define MODE_AUTO   0
@@ -103,7 +111,8 @@
 #define MODE_OFF    2
 
 /* connectivity preference saved by setup UI. A fresh/unset unit starts the
- * setup AP; after a choice is saved, normal boots follow that mode. */
+ * setup AP. CONN_AP means standalone/offline after setup; the AP only returns
+ * for physical service button access or full reset. */
 #define CONN_AP         0
 #define CONN_ZIGBEE     1
 #define CONN_WIFI       2
@@ -113,10 +122,10 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x01000012   /* 1.0.0.18 - Zigbee telemetry on-change reporting (check_change=true) so depth/level/fault/pressure update like WiFi */
+#define OTA_FW_VERSION      0x01000015   /* 1.0.0.21 - standalone mode hides setup AP after save */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101
 #define OTA_MAX_DATA_SIZE   223          /* max OTA block payload bytes */
 #define OTA_QUERY_INTERVAL_MIN 5         /* client retry interval        */
-#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.11"
+#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.21"
