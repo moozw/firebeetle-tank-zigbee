@@ -29,6 +29,7 @@
 #include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
+#include "mbedtls/base64.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "mdns.h"
@@ -74,11 +75,13 @@ typedef struct {
     uint8_t  lockout_enabled;
     uint16_t lockout_start_min;
     uint16_t lockout_end_min;
+    char     web_pass[33];      /* config-page admin password (WiFi mode) */
+    uint8_t  web_pass_changed;  /* 0 = still the shipped default          */
 } cfg_t;
 
 static cfg_t g_cfg = {
     .magic     = 0x544b,     /* "TK" */
-    .version   = 5,
+    .version   = 6,
     .calibrated = 0,
     .low_cm    = DEFAULT_LEVEL_LOW_CM,
     .operating_cm = DEFAULT_OPERATING_CM,
@@ -97,13 +100,15 @@ static cfg_t g_cfg = {
     .mqtt_user = "",
     .mqtt_pass = "",
     .mqtt_topic = DEFAULT_MQTT_TOPIC,
+    .web_pass = SETUP_WEB_DEFAULT_PASS,
+    .web_pass_changed = 0,
 };
 static SemaphoreHandle_t g_cfg_mtx;
 static void cfg_save(void);
 
 static const cfg_t DEFAULT_CFG = {
     .magic     = 0x544b,
-    .version   = 5,
+    .version   = 6,
     .calibrated = 0,
     .low_cm    = DEFAULT_LEVEL_LOW_CM,
     .operating_cm = DEFAULT_OPERATING_CM,
@@ -122,6 +127,8 @@ static const cfg_t DEFAULT_CFG = {
     .mqtt_user = "",
     .mqtt_pass = "",
     .mqtt_topic = DEFAULT_MQTT_TOPIC,
+    .web_pass = SETUP_WEB_DEFAULT_PASS,
+    .web_pass_changed = 0,
 };
 
 static const char *cfg_validate(const cfg_t *cfg, bool require_wifi_ssid)
@@ -146,6 +153,8 @@ static const char *cfg_validate(const cfg_t *cfg, bool require_wifi_ssid)
     if (cfg->mqtt_user[sizeof(cfg->mqtt_user) - 1] != '\0') return "mqtt_user_terminated";
     if (cfg->mqtt_pass[sizeof(cfg->mqtt_pass) - 1] != '\0') return "mqtt_pass_terminated";
     if (cfg->mqtt_topic[sizeof(cfg->mqtt_topic) - 1] != '\0') return "mqtt_topic_terminated";
+    if (cfg->web_pass_changed > 1) return "web_pass_changed";
+    if (cfg->web_pass[sizeof(cfg->web_pass) - 1] != '\0') return "web_pass_terminated";
     return NULL;
 }
 
@@ -175,6 +184,7 @@ static httpd_handle_t s_httpd = NULL;
 static int s_wifi_retry = 0;
 static volatile bool s_wifi_started = false;
 static volatile bool s_setup_portal_active = false;
+static volatile bool s_web_auth = false;    /* require Basic auth (set in WiFi/STA mode) */
 
 /* ----------------------------- NVS persistence -------------------------- */
 static void cfg_load(void)
@@ -188,10 +198,16 @@ static void cfg_load(void)
         g_cfg = DEFAULT_CFG;
         err = nvs_get_blob(h, "cfg", &g_cfg, &sz);
         if (err == ESP_OK && g_cfg.version == 4) {
-            g_cfg.version = DEFAULT_CFG.version;
             g_cfg.lockout_enabled = 0;
             g_cfg.lockout_start_min = DEFAULT_LOCKOUT_START_MIN;
             g_cfg.lockout_end_min = DEFAULT_LOCKOUT_END_MIN;
+            g_cfg.version = 5;
+            migrated = true;
+        }
+        if (err == ESP_OK && g_cfg.version == 5) {
+            /* web_pass/web_pass_changed already defaulted from DEFAULT_CFG since
+             * they sit past the end of the older (v5) stored blob */
+            g_cfg.version = 6;
             migrated = true;
         }
     }
@@ -654,8 +670,45 @@ static void zb_push_mode(uint8_t mode)
 
 /* ----------------------------- setup portal ----------------------------- */
 #if SETUP_PORTAL_ENABLE
+
+/* HTTP Basic auth, enforced only when s_web_auth is set (local-WiFi/STA mode).
+ * Username is fixed (SETUP_WEB_USER); password is cfg.web_pass. Returns true if
+ * the request is allowed to proceed. */
+static bool web_auth_ok(httpd_req_t *req)
+{
+    if (!s_web_auth) return true;            /* setup AP: open */
+
+    char hdr[160];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) != ESP_OK) return false;
+    if (strncmp(hdr, "Basic ", 6) != 0) return false;
+
+    unsigned char dec[128];
+    size_t olen = 0;
+    const char *b64 = hdr + 6;
+    if (mbedtls_base64_decode(dec, sizeof(dec) - 1, &olen, (const unsigned char *)b64, strlen(b64)) != 0)
+        return false;
+    dec[olen] = '\0';
+
+    char expect[100];
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    int n = snprintf(expect, sizeof(expect), "%s:%s", SETUP_WEB_USER, g_cfg.web_pass);
+    xSemaphoreGive(g_cfg_mtx);
+    if (n < 0 || n >= (int)sizeof(expect)) return false;
+    return strcmp((char *)dec, expect) == 0;
+}
+
+static esp_err_t web_auth_challenge(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Tank Controller\"");
+    return httpd_resp_send(req, "Authentication required", HTTPD_RESP_USE_STRLEN);
+}
+
+#define WEB_REQUIRE_AUTH(req) do { if (!web_auth_ok(req)) return web_auth_challenge(req); } while (0)
+
 static esp_err_t setup_status_get(httpd_req_t *req)
 {
+    WEB_REQUIRE_AUTH(req);
     cfg_t cfg;
     xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
     cfg = g_cfg;
@@ -678,6 +731,7 @@ static esp_err_t setup_status_get(httpd_req_t *req)
         "\"low_cm\":%d,\"operating_cm\":%d,\"full_cm\":%d,\"tank_height_cm\":%d,\"density\":%u,"
         "\"mode\":%u,\"conn_mode\":%u,\"lockout_enabled\":%u,\"lockout_start_min\":%u,"
         "\"lockout_end_min\":%u,\"lockout_active\":%u,\"time_valid\":%u,"
+        "\"web_pass_changed\":%u,\"wifi_auth\":%s,"
         "\"wifi_connected\":%s,\"mqtt_connected\":%s,"
         "\"wifi_ssid\":\"%s\",\"mqtt_host\":\"%s\",\"mqtt_user\":\"%s\",\"mqtt_topic\":\"%s\"}",
         g_baro_pressure_hpa_x100 >= 0 ? (double)g_baro_pressure_hpa_x100 / 100.0 : -1.0,
@@ -688,6 +742,7 @@ static esp_err_t setup_status_get(httpd_req_t *req)
         cfg.calibrated, (double)cfg.air_offset_hpa_x100 / 100.0,
         cfg.low_cm, cfg.operating_cm, cfg.full_cm, cfg.tank_h_cm, cfg.density, cfg.mode, cfg.conn_mode,
         cfg.lockout_enabled, cfg.lockout_start_min, cfg.lockout_end_min, g_lockout_active, g_time_valid,
+        cfg.web_pass_changed, s_web_auth ? "true" : "false",
         s_wifi_connected ? "true" : "false", s_mqtt_connected ? "true" : "false",
         wifi_ssid, mqtt_host, mqtt_user, mqtt_topic);
     if (n < 0) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Status format failed");
@@ -698,6 +753,7 @@ static esp_err_t setup_status_get(httpd_req_t *req)
 
 static esp_err_t setup_root_get(httpd_req_t *req)
 {
+    WEB_REQUIRE_AUTH(req);
     static const char html[] =
         "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>Tank Setup</title><style>"
@@ -731,6 +787,8 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "<label>MQTT broker IP/host<input id=mh placeholder='192.168.1.10'></label><label>MQTT topic<input id=mt></label>"
         "<label>MQTT user<input id=mu></label><label>MQTT password<input id=mp type=password autocomplete=off></label>"
         "</div></section>"
+        "<section><h2>Page Security</h2><p id=webhint class=hint></p>"
+        "<label>Page login password (user: admin)<input id=webpass type=password autocomplete=off placeholder='set a new password'></label></section>"
         "<section><h2>Save</h2><p id=cal2 class=warn></p><p id=connhint class=warn></p><p id=rulehint class=hint></p>"
         "<button onclick=save()>Save parameters</button> <button onclick=saveReboot()>Save &amp; reboot</button></section>"
         "<p id=msg></p><p class=hint>Hold button 3s to reopen setup. Hold 10s for factory reset.</p></main><script>"
@@ -742,7 +800,7 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "$('connhint').textContent=(c=='1')?'Zigbee selected: AP will disappear and the device will join Zigbee.':(c=='2')?'Local WiFi selected: AP will disappear; setup moves to the local WiFi address.':(c=='0')?'Standalone selected: AP will disappear; hold button 3s to reopen setup.':'Choose a connectivity option, then Save & reboot.';"
         "validateLocal()}"
         "function validateLocal(){let lo=Number($('low').value),op=Number($('op').value),fu=Number($('full').value),hi=Number($('height').value);let ok=lo>=0&&op>=lo&&fu>op&&fu<=hi+20;$('rulehint').textContent=ok?'Level order looks valid.':'Check level order: low <= operating < full <= tank height.';$('rulehint').className=ok?'hint':'hint bad';return ok}"
-        "function bindEdits(){['low','op','full','height','density','mode','conn','lock','lstart','lend','ssid','wpass','mh','mu','mp','mt'].forEach(id=>{$(id).oninput=()=>{changed.add(id);updateHints()};$(id).onchange=()=>{changed.add(id);updateHints()}})}"
+        "function bindEdits(){['low','op','full','height','density','mode','conn','lock','lstart','lend','ssid','wpass','mh','mu','mp','mt','webpass'].forEach(id=>{$(id).oninput=()=>{changed.add(id);updateHints()};$(id).onchange=()=>{changed.add(id);updateHints()}})}"
         "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('lock').value=s.lockout_enabled;$('lstart').value=minToTime(s.lockout_start_min);$('lend').value=minToTime(s.lockout_end_min);$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';updateHints();changed.clear()}"
         "async function refresh(){let s=await(await fetch('/api/status')).json();syncForm(s)}"
         "async function load(){let r=await fetch('/api/status');let s=await r.json();"
@@ -752,10 +810,11 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "$('lockstat').textContent=s.lockout_active?'ON':'off';$('clockstat').textContent=s.time_valid?'synced':'not synced';"
         "$('wifistat').textContent=s.wifi_connected?'connected':'off';$('mqttstat').textContent=s.mqtt_connected?'connected':'off';"
         "calibrated=!!s.calibrated;let cal=calibrated?'<span class=ok>Calibrated</span>':'<span class=warn>Not calibrated: AUTO pump control stays safe/off</span>';$('cal').innerHTML=cal;$('cal2').innerHTML=calibrated?'':cal;"
+        "$('webhint').textContent=s.web_pass_changed?'Page login required over local WiFi (user: admin).':('Default login admin / " SETUP_WEB_DEFAULT_PASS " in use - set a new password below'+(s.wifi_auth?', required before saving.':' before switching to WiFi.'));$('webhint').className=s.web_pass_changed?'hint':'hint bad';"
         "if(!formInit){syncForm(s);formInit=true}}"
         "async function post(u){let r=await fetch(u,{method:'POST'});$('msg').textContent=await r.text();refresh()}"
         "async function calPost(u,msg){if(calibrated&&!confirm(msg))return;await post(u)}"
-        "async function save(){let p=new URLSearchParams();changed.forEach(id=>{let v=$(id).value;if(id=='lstart'||id=='lend')v=timeToMin(v);p.append(id,v)});let r=await fetch('/api/config',{method:'POST',body:p});$('msg').textContent=await r.text();if(r.ok){$('wpass').value='';$('mp').value='';refresh()}return r.ok}"
+        "async function save(){let p=new URLSearchParams();changed.forEach(id=>{let v=$(id).value;if(id=='lstart'||id=='lend')v=timeToMin(v);p.append(id,v)});let r=await fetch('/api/config',{method:'POST',body:p});$('msg').textContent=await r.text();if(r.ok){$('wpass').value='';$('mp').value='';$('webpass').value='';refresh()}return r.ok}"
         "async function saveReboot(){let mode=$('conn').value;let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent=(mode=='2')?'Saved - rebooting; this AP will disappear and the page will move to local WiFi.':(mode=='1')?'Saved - rebooting; this AP will disappear and the device will join Zigbee.':'Saved - rebooting; this AP will disappear. Hold button 3s to reopen setup.'}}"
         "bindEdits();load();setInterval(load,3000)</script></body></html>";
     httpd_resp_set_type(req, "text/html");
@@ -769,6 +828,7 @@ static bool setup_has_two_pressures(void)
 
 static esp_err_t setup_open_air_post(httpd_req_t *req)
 {
+    WEB_REQUIRE_AUTH(req);
     if (!setup_has_two_pressures()) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Both sensors must be reading in open air");
     }
@@ -782,6 +842,7 @@ static esp_err_t setup_open_air_post(httpd_req_t *req)
 
 static esp_err_t setup_full_tank_post(httpd_req_t *req)
 {
+    WEB_REQUIRE_AUTH(req);
     if (!setup_has_two_pressures()) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Both sensors must be reading for full-tank calibration");
     }
@@ -812,6 +873,7 @@ static esp_err_t setup_full_tank_post(httpd_req_t *req)
 
 static esp_err_t setup_config_post(httpd_req_t *req)
 {
+    WEB_REQUIRE_AUTH(req);
     xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
     cfg_t cfg = g_cfg;
     xSemaphoreGive(g_cfg_mtx);
@@ -851,6 +913,19 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     if (maybe_pass[0]) strlcpy(cfg.mqtt_pass, maybe_pass, sizeof(cfg.mqtt_pass));
     if (!cfg.mqtt_topic[0]) strlcpy(cfg.mqtt_topic, DEFAULT_MQTT_TOPIC, sizeof(cfg.mqtt_topic));
 
+    char newweb[33] = "";
+    copy_form_str(form, "webpass", newweb, sizeof(newweb));
+    if (newweb[0]) {
+        strlcpy(cfg.web_pass, newweb, sizeof(cfg.web_pass));
+        cfg.web_pass_changed = 1;
+    }
+    /* over local WiFi, force the default page password to be changed before any
+     * settings can be saved (the setup AP is exempt - you physically join it) */
+    if (s_web_auth && !cfg.web_pass_changed) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "Set a new page password (admin login) before saving over WiFi");
+    }
+
     const char *bad = cfg_validate(&cfg, true);
     if (bad) {
         char msg[80];
@@ -877,6 +952,7 @@ static void reboot_task(void *arg)
 
 static esp_err_t setup_reboot_post(httpd_req_t *req)
 {
+    WEB_REQUIRE_AUTH(req);
     httpd_resp_sendstr(req, "Rebooting");
     ESP_LOGI(TAG, "reboot requested via setup portal");
     xTaskCreate(reboot_task, "reboot", 2048, NULL, 5, NULL);
@@ -1036,6 +1112,7 @@ static bool wifi_station_start(void)
     }
 
     time_sync_start();
+    s_web_auth = true;            /* on shared WiFi: require admin login for the page */
     web_server_start();
     mqtt_start();
     return true;
