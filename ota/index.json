@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "tank2_v1.0.21.ota",
-    "fileVersion": 16777237,
-    "fileSize": 1621774,
+    "fileName": "tank2_v1.0.24.ota",
+    "fileVersion": 16777240,
+    "fileSize": 1666078,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "9ead49cd55cc89beaa85aed9471c6015fa0912850145af27b94a914fd1422a2fce9d9b2aae6d56d2deba6ed2aa934fd2a2e98bfad79bccaee2f069362b64657d",
-    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.21/tank2_v1.0.21.ota",
+    "sha512": "564130600f74313c83c862178ce00f313d06d2e97f5a5548abbe771452e207ba14091a24fe2d1e755343d6fb8fee7d83088ef8d4c3c86ae3b60641953d5dfd7f",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.24/tank2_v1.0.24.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.21: standalone mode hides setup AP after save, service button AP, lockout controls, temperature telemetry, and config validation."
+    "releaseNotes": "Firmware v1.0.24 (OTA version 0x01000018)."
   }
 ]
