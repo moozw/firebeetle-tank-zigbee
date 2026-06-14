@@ -634,6 +634,14 @@ static void zb_push_telemetry(void)
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID, &g_baro_pressure_hpa, false);
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_SCALED_VALUE_ID, &g_tank_pressure_hpa, false);
 
+    /* standard reportable sensor endpoints (these DO auto-report) */
+    float depth_f = (float)g_depth_cm;
+    float level_f = (float)g_level_pct;
+    esp_zb_zcl_set_attribute_val(ZB_EP_DEPTH, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &depth_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_LEVEL, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &level_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_WATER_TEMP, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, &g_water_temp_c_x100, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_EXT_TEMP, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, &g_external_temp_c_x100, false);
+
     esp_zb_lock_release();
 }
 
@@ -1597,6 +1605,35 @@ static void add_custom_cluster(esp_zb_cluster_list_t *list)
     esp_zb_cluster_list_add_custom_cluster(list, c, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 }
 
+/* a single-cluster sensor endpoint carrying a standard genAnalogInput - the
+ * stack auto-reports presentValue once the coordinator configures reporting. */
+static void add_analog_input_ep(esp_zb_ep_list_t *ep_list, uint8_t endpoint)
+{
+    esp_zb_analog_input_cluster_cfg_t cfg = { .out_of_service = 0, .present_value = 0, .status_flags = 0 };
+    esp_zb_attribute_list_t *ai = esp_zb_analog_input_cluster_create(&cfg);
+    esp_zb_cluster_list_t *cl = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_analog_input_cluster(cl, ai, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_endpoint_config_t epc = {
+        .endpoint = endpoint, .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID, .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, cl, epc);
+}
+
+/* a single-cluster endpoint carrying a standard msTemperatureMeasurement (degC x100). */
+static void add_temp_meas_ep(esp_zb_ep_list_t *ep_list, uint8_t endpoint)
+{
+    esp_zb_temperature_meas_cluster_cfg_t cfg = { .measured_value = INT16_MIN, .min_value = -4000, .max_value = 12500 };
+    esp_zb_attribute_list_t *t = esp_zb_temperature_meas_cluster_create(&cfg);
+    esp_zb_cluster_list_t *cl = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_temperature_meas_cluster(cl, t, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_endpoint_config_t epc = {
+        .endpoint = endpoint, .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_TEMPERATURE_SENSOR_DEVICE_ID, .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, cl, epc);
+}
+
 static void esp_zb_task(void *arg)
 {
     s_zb_started = true;
@@ -1672,6 +1709,13 @@ static void esp_zb_task(void *arg)
         .app_device_version = 0,
     };
     esp_zb_ep_list_add_ep(ep_list, clusters, ep_cfg);
+
+    /* standard reportable sensor endpoints (depth/level/temps) - the stack
+     * auto-reports these, unlike the custom 0xFC11 cluster */
+    add_analog_input_ep(ep_list, ZB_EP_DEPTH);
+    add_analog_input_ep(ep_list, ZB_EP_LEVEL);
+    add_temp_meas_ep(ep_list, ZB_EP_WATER_TEMP);
+    add_temp_meas_ep(ep_list, ZB_EP_EXT_TEMP);
 
     esp_zb_device_register(ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);

@@ -87,6 +87,12 @@
 
 /* ---------- Zigbee ---------- */
 #define ZB_ENDPOINT             10
+/* Extra endpoints carrying STANDARD reportable clusters so the esp-zigbee stack
+ * auto-reports them (the custom 0xFC11 cluster does not auto-report). */
+#define ZB_EP_DEPTH             11   /* genAnalogInput  - depth cm   */
+#define ZB_EP_LEVEL             12   /* genAnalogInput  - level %    */
+#define ZB_EP_WATER_TEMP        13   /* msTemperatureMeasurement     */
+#define ZB_EP_EXT_TEMP          14   /* msTemperatureMeasurement     */
 #define ZB_PRIMARY_CHANNEL_MASK (1l << 15)   /* try ch 15 first; full mask also set */
 #define ZB_MANUF_CODE           0x1224       /* manufacturer code for custom attrs */
 #define ZB_CUSTOM_CLUSTER_ID    0xFC11       /* our private telemetry/config cluster */
@@ -129,7 +135,7 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x0100001B   /* 1.0.0.27 - Zigbee telemetry: check_change=false only (no manual reports - they assert) */
+#define OTA_FW_VERSION      0x0100001C   /* 1.0.0.28 - depth/level via genAnalogInput + temps via temp-meas endpoints (auto-report) */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101

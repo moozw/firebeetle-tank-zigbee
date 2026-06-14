@@ -84,6 +84,34 @@ const fzPressure = {
     },
 };
 
+// depth/level live on standard genAnalogInput endpoints (11/12) so the stack
+// auto-reports them (the custom 0xFC11 cluster does not).
+const fzAnalog = {
+    cluster: 'genAnalogInput',
+    type: ['attributeReport', 'readResponse'],
+    convert: (model, msg, publish, options, meta) => {
+        const v = msg.data['presentValue'];
+        if (v === undefined) return {};
+        if (msg.endpoint.ID === 11) return {depth: v};
+        if (msg.endpoint.ID === 12) return {level: v};
+        return {};
+    },
+};
+
+// water/reference temperature on standard temperature-measurement endpoints (13/14)
+const fzTempEp = {
+    cluster: 'msTemperatureMeasurement',
+    type: ['attributeReport', 'readResponse'],
+    convert: (model, msg, publish, options, meta) => {
+        const v = msg.data['measuredValue'];
+        if (v === undefined || v === -32768) return {};
+        const c = v / 100;
+        if (msg.endpoint.ID === 13) return {water_temperature: c};
+        if (msg.endpoint.ID === 14) return {external_temperature: c};
+        return {};
+    },
+};
+
 // settable config attributes
 const tzTank = {
     key: ['low_alert_cm', 'operating_cm', 'full_cm', 'tank_height_cm', 'density', 'mode', 'pump_lockout'],
@@ -131,7 +159,7 @@ module.exports = [
         vendor: 'DIY',
         description: 'FireBeetle 2 ESP32-C5 underwater tank level / fill relay',
         ota: true,                 // enable wireless firmware updates (served from the OTA override index)
-        fromZigbee: [fz.on_off, fzTank, fzPressure],
+        fromZigbee: [fz.on_off, fzTank, fzPressure, fzAnalog, fzTempEp],
         toZigbee: [tz.on_off, tzTank, tzTankRead],
         configure: async (device, coordinatorEndpoint) => {
             const ep = device.getEndpoint(10);
@@ -160,6 +188,21 @@ module.exports = [
                     {attribute: {ID: 0x1A, type: U8},  minimumReportInterval: 0, maximumReportInterval: 120, reportableChange: 0},
                 ]);
             } catch (e) {}
+            // standard reportable sensor endpoints - these actually auto-report
+            for (const epId of [11, 12]) {
+                try {
+                    const se = device.getEndpoint(epId);
+                    await se.bind('genAnalogInput', coordinatorEndpoint);
+                    await se.configureReporting('genAnalogInput', [{attribute: 'presentValue', minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 1}]);
+                } catch (e) {}
+            }
+            for (const epId of [13, 14]) {
+                try {
+                    const se = device.getEndpoint(epId);
+                    await se.bind('msTemperatureMeasurement', coordinatorEndpoint);
+                    await se.configureReporting('msTemperatureMeasurement', [{attribute: 'measuredValue', minimumReportInterval: 0, maximumReportInterval: 30, reportableChange: 25}]);
+                } catch (e) {}
+            }
         },
         exposes: [
             e.switch(),
