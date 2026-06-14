@@ -113,7 +113,7 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x01000011   /* 1.0.0.17 - sensor hot-plug retry, always-visible Save (Zigbee reboot), form no longer reverts edits */
+#define OTA_FW_VERSION      0x01000012   /* 1.0.0.18 - Zigbee telemetry on-change reporting (check_change=true) so depth/level/fault/pressure update like WiFi */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101
