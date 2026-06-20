@@ -1468,21 +1468,49 @@ static volatile bool s_ota_failed = false;
 /* s_ota_active is declared up top so the telemetry gate can see it */
 #define OTA_SUBELEMENT_HDR  6               /* tag id (2) + length (4)           */
 
-/* Writer task: does all the slow flash erase/write off the radio callback, so
- * the Zigbee stack is never stalled (esp_ota_write inside the callback -> zb_assert). */
+/* Writer task: does all flash work off the radio callback and batches the
+ * small Zigbee blocks. Writing every block separately eventually starves the
+ * C5 radio long enough for ZBOSS to assert in its MAC ACK timeout handler. */
 static void ota_writer_task(void *arg)
 {
     ESP_LOGI(TAG, "OTA writer -> %s", s_ota_part->label);
 
-    uint8_t buf[512];
-    while (1) {
-        size_t n = xStreamBufferReceive(s_ota_sb, buf, sizeof(buf), pdMS_TO_TICKS(200));
-        if (n > 0) {
-            if (esp_ota_write(s_ota_handle, buf, n) != ESP_OK) { s_ota_failed = true; break; }
-            s_ota_bytes += n;
-        }
-        if (s_ota_finish && xStreamBufferIsEmpty(s_ota_sb)) break;
+    uint8_t *buf = malloc(4096);
+    if (!buf) {
+        ESP_LOGE(TAG, "OTA writer buffer allocation failed");
+        s_ota_failed = true;
+        s_ota_finish = true;
     }
+
+    size_t used = 0;
+    while (1) {
+        if (!s_ota_failed) {
+            size_t n = xStreamBufferReceive(s_ota_sb, buf + used, 4096 - used,
+                                            pdMS_TO_TICKS(200));
+            used += n;
+            if (used == 4096) {
+                if (esp_ota_write(s_ota_handle, buf, used) != ESP_OK) {
+                    s_ota_failed = true;
+                } else {
+                    s_ota_bytes += used;
+                    used = 0;
+                }
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (s_ota_finish && (s_ota_failed || xStreamBufferIsEmpty(s_ota_sb))) {
+            if (!s_ota_failed && used > 0) {
+                if (esp_ota_write(s_ota_handle, buf, used) != ESP_OK) {
+                    s_ota_failed = true;
+                } else {
+                    s_ota_bytes += used;
+                }
+            }
+            break;
+        }
+    }
+    free(buf);
 
     if (!s_ota_failed && esp_ota_end(s_ota_handle) == ESP_OK
                       && esp_ota_set_boot_partition(s_ota_part) == ESP_OK) {

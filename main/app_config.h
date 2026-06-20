@@ -148,10 +148,10 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x01000026   /* 1.0.0.38 - OTA validation release */
+#define OTA_FW_VERSION      0x01000027   /* 1.0.0.39 - batched OTA flash writes */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101
 #define OTA_MAX_DATA_SIZE   223          /* max OTA block payload bytes */
 #define OTA_QUERY_INTERVAL_S 60          /* delay after server discovery */
-#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.38"
+#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.39"
