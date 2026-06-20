@@ -19,8 +19,8 @@
 
 #define BUTTON_GPIO         28     /* onboard BOOT button, active-low (idle HIGH) */
 #define BUTTON_DEBOUNCE_MS  40
-#define BUTTON_SERVICE_AP_MS 3000  /* hold while running: temporary setup AP    */
-#define BUTTON_FACTORY_RESET_MS 10000 /* hold while running: full factory reset */
+#define BUTTON_CLICK_MAX_MS 1000   /* longer holds cancel the click sequence    */
+#define BUTTON_MULTI_CLICK_MS 700  /* wait after release for another click      */
 
 /* ---------- I2C addresses ---------- */
 /* Both Adafruit LPS2x boards power up on the same address. Current swapped
@@ -92,7 +92,19 @@
 #define ZB_EP_DEPTH             11   /* genAnalogInput  - depth cm   */
 #define ZB_EP_LEVEL             12   /* genAnalogInput  - level %    */
 #define ZB_EP_WATER_TEMP        13   /* msTemperatureMeasurement     */
-#define ZB_EP_EXT_TEMP          14   /* msTemperatureMeasurement     */
+#define ZB_EP_AIR_TEMP          14   /* msTemperatureMeasurement     */
+#define ZB_EP_FAULT             15   /* genAnalogInput - fault code  */
+#define ZB_EP_BARO_PRESSURE     16   /* genAnalogInput - hPa         */
+#define ZB_EP_TANK_PRESSURE     17   /* genAnalogInput - hPa         */
+#define ZB_EP_LOW_ALERT         18   /* genAnalogInput - boolean     */
+#define ZB_EP_RELAY             19   /* genAnalogInput - boolean     */
+#define ZB_EP_MODE              20   /* genAnalogInput - mode enum   */
+#define ZB_EP_SET_LOW           23   /* genAnalogOutput - cm         */
+#define ZB_EP_SET_OPERATING     24   /* genAnalogOutput - cm         */
+#define ZB_EP_SET_FULL          25   /* genAnalogOutput - cm         */
+#define ZB_EP_SET_TANK_HEIGHT   26   /* genAnalogOutput - cm         */
+#define ZB_EP_SET_DENSITY       27   /* genAnalogOutput - kg/m3      */
+#define ZB_EP_SET_MODE          28   /* genAnalogOutput - mode enum  */
 #define ZB_PRIMARY_CHANNEL_MASK (1l << 15)   /* try ch 15 first; full mask also set */
 #define ZB_MANUF_CODE           0x1224       /* manufacturer code for custom attrs */
 #define ZB_CUSTOM_CLUSTER_ID    0xFC11       /* our private telemetry/config cluster */
@@ -104,8 +116,9 @@
 #define ATTR_BARO_PRESSURE_HPA  0x0003  /* s16, read-only, reported   */
 #define ATTR_TANK_PRESSURE_HPA  0x0004  /* s16, read-only, reported   */
 #define ATTR_LOW_ALERT          0x0005  /* u8,  read-only, reported   */
-#define ATTR_EXTERNAL_TEMP_CX100 0x0006 /* s16, read-only, reported, degC x100 */
+#define ATTR_AIR_TEMP_CX100     0x0006 /* s16, read-only, reported, degC x100 */
 #define ATTR_WATER_TEMP_CX100   0x0007  /* s16, read-only, reported, degC x100 */
+#define ATTR_RELAY_STATE        0x0008  /* u8,  read-only controller output     */
 #define ATTR_SET_LOW_CM         0x0010  /* s16, read/write            */
 #define ATTR_SET_FULL_CM        0x0011  /* s16, read/write            */
 #define ATTR_TANK_HEIGHT_CM     0x0012  /* s16, read/write            */
@@ -135,10 +148,10 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x0100001C   /* 1.0.0.28 - depth/level via genAnalogInput + temps via temp-meas endpoints (auto-report) */
+#define OTA_FW_VERSION      0x01000026   /* 1.0.0.38 - OTA validation release */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101
 #define OTA_MAX_DATA_SIZE   223          /* max OTA block payload bytes */
-#define OTA_QUERY_INTERVAL_MIN 5         /* client retry interval        */
-#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.21"
+#define OTA_QUERY_INTERVAL_S 60          /* delay after server discovery */
+#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.38"

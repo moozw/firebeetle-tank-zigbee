@@ -47,6 +47,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_zigbee_core.h"
+#include "esp_zigbee_ota.h"
 
 #include "app_config.h"
 #include "lps2x.h"
@@ -164,7 +165,7 @@ static int16_t g_baro_pressure_hpa = -1;
 static int16_t g_tank_pressure_hpa = -1;
 static int32_t g_baro_pressure_hpa_x100 = -1;
 static int32_t g_tank_pressure_hpa_x100 = -1;
-static int16_t g_external_temp_c_x100 = INT16_MIN;
+static int16_t g_air_temp_c_x100 = INT16_MIN;
 static int16_t g_water_temp_c_x100 = INT16_MIN;
 static uint8_t g_level_pct = 0;
 static uint8_t g_fault     = 0;
@@ -369,13 +370,13 @@ static void mqtt_publish_state(void)
         "\"relay\":%s,\"mode\":%u,\"low_cm\":%d,\"operating_cm\":%d,\"full_cm\":%d,"
         "\"lockout_enabled\":%u,\"lockout_start_min\":%u,\"lockout_end_min\":%u,"
         "\"lockout_active\":%u,\"time_valid\":%u,"
-        "\"baro_hpa\":%.2f,\"tank_hpa\":%.2f,\"external_temp_c\":%.2f,\"water_temp_c\":%.2f}",
+        "\"baro_hpa\":%.2f,\"tank_hpa\":%.2f,\"air_temp_c\":%.2f,\"water_temp_c\":%.2f}",
         g_depth_cm, g_level_pct, g_fault, g_low_alert, g_relay_on ? "true" : "false",
         cfg.mode, cfg.low_cm, cfg.operating_cm, cfg.full_cm,
         cfg.lockout_enabled, cfg.lockout_start_min, cfg.lockout_end_min, g_lockout_active, g_time_valid,
         g_baro_pressure_hpa_x100 >= 0 ? (double)g_baro_pressure_hpa_x100 / 100.0 : -1.0,
         g_tank_pressure_hpa_x100 >= 0 ? (double)g_tank_pressure_hpa_x100 / 100.0 : -1.0,
-        g_external_temp_c_x100 != INT16_MIN ? (double)g_external_temp_c_x100 / 100.0 : -99.99,
+        g_air_temp_c_x100 != INT16_MIN ? (double)g_air_temp_c_x100 / 100.0 : -99.99,
         g_water_temp_c_x100 != INT16_MIN ? (double)g_water_temp_c_x100 / 100.0 : -99.99);
     if (n < 0) return;
     if (n >= (int)sizeof(payload)) n = strlen(payload);
@@ -625,22 +626,53 @@ static void zb_push_telemetry(void)
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LOW_ALERT, &g_low_alert, false);
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_BARO_PRESSURE_HPA, &g_baro_pressure_hpa, false);
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TANK_PRESSURE_HPA, &g_tank_pressure_hpa, false);
-    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_EXTERNAL_TEMP_CX100, &g_external_temp_c_x100, false);
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_AIR_TEMP_CX100, &g_air_temp_c_x100, false);
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_WATER_TEMP_CX100, &g_water_temp_c_x100, false);
+    uint8_t relay = g_relay_on ? 1 : 0;
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_RELAY_STATE, &relay, false);
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_LOCKOUT_ACTIVE, &g_lockout_active, false);
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_TIME_VALID, &g_time_valid, false);
-    uint8_t on = g_relay_on ? 1 : 0;
-    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on, false);
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg_t cfg = g_cfg;
+    xSemaphoreGive(g_cfg_mtx);
+    uint8_t lockout = cfg.lockout_enabled ? 1 : 0;
+    uint8_t mode = cfg.mode;
+    /* The standard on/off switch is the AUTO lockout input, not a direct relay
+     * command. FORCE ON and FORCE OFF remain controller modes. */
+    esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &lockout, false);
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID, &g_baro_pressure_hpa, false);
     esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_SCALED_VALUE_ID, &g_tank_pressure_hpa, false);
 
     /* standard reportable sensor endpoints (these DO auto-report) */
     float depth_f = (float)g_depth_cm;
     float level_f = (float)g_level_pct;
+    float fault_f = (float)g_fault;
+    float baro_f = (float)g_baro_pressure_hpa;
+    float tank_f = (float)g_tank_pressure_hpa;
+    float low_alert_f = (float)g_low_alert;
+    float relay_f = relay ? 1.0f : 0.0f;
+    float mode_f = (float)mode;
+    float low_set_f = (float)cfg.low_cm;
+    float operating_set_f = (float)cfg.operating_cm;
+    float full_set_f = (float)cfg.full_cm;
+    float tank_height_set_f = (float)cfg.tank_h_cm;
+    float density_set_f = (float)cfg.density;
     esp_zb_zcl_set_attribute_val(ZB_EP_DEPTH, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &depth_f, false);
     esp_zb_zcl_set_attribute_val(ZB_EP_LEVEL, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &level_f, false);
     esp_zb_zcl_set_attribute_val(ZB_EP_WATER_TEMP, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, &g_water_temp_c_x100, false);
-    esp_zb_zcl_set_attribute_val(ZB_EP_EXT_TEMP, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, &g_external_temp_c_x100, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_AIR_TEMP, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, &g_air_temp_c_x100, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_FAULT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &fault_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_BARO_PRESSURE, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &baro_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_TANK_PRESSURE, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &tank_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_LOW_ALERT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &low_alert_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_RELAY, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &relay_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_MODE, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &mode_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_SET_LOW, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &low_set_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_SET_OPERATING, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &operating_set_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_SET_FULL, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &full_set_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_SET_TANK_HEIGHT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &tank_height_set_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_SET_DENSITY, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &density_set_f, false);
+    esp_zb_zcl_set_attribute_val(ZB_EP_SET_MODE, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &mode_f, false);
 
     esp_zb_lock_release();
 }
@@ -652,8 +684,21 @@ static void zb_push_mode(uint8_t mode)
     esp_zb_lock_acquire(portMAX_DELAY);
     esp_err_t err = esp_zb_zcl_set_attribute_val(ZB_ENDPOINT, ZB_CUSTOM_CLUSTER_ID,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ATTR_MODE, &mode, false);
+    float mode_f = (float)mode;
+    esp_err_t standard_err = esp_zb_zcl_set_attribute_val(ZB_EP_SET_MODE,
+        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &mode_f, false);
+    esp_err_t report_err = esp_zb_zcl_set_attribute_val(ZB_EP_MODE,
+        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &mode_f, false);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Zigbee mode attr update failed: %s", esp_err_to_name(err));
+    }
+    if (standard_err != ESP_OK) {
+        ESP_LOGW(TAG, "Zigbee standard mode update failed: %s", esp_err_to_name(standard_err));
+    }
+    if (report_err != ESP_OK) {
+        ESP_LOGW(TAG, "Zigbee mode report endpoint update failed: %s", esp_err_to_name(report_err));
     }
     esp_zb_lock_release();
 }
@@ -715,7 +760,7 @@ static esp_err_t setup_status_get(httpd_req_t *req)
 
     char json[1220];
     int n = snprintf(json, sizeof(json),
-        "{\"baro_hpa\":%.2f,\"tank_hpa\":%.2f,\"external_temp_c\":%.2f,\"water_temp_c\":%.2f,"
+        "{\"baro_hpa\":%.2f,\"tank_hpa\":%.2f,\"air_temp_c\":%.2f,\"water_temp_c\":%.2f,"
         "\"depth_cm\":%d,\"level_pct\":%u,"
         "\"fault\":%u,\"low_alert\":%u,\"relay\":%s,\"calibrated\":%u,\"air_offset_hpa\":%.2f,"
         "\"low_cm\":%d,\"operating_cm\":%d,\"full_cm\":%d,\"tank_height_cm\":%d,\"density\":%u,"
@@ -726,7 +771,7 @@ static esp_err_t setup_status_get(httpd_req_t *req)
         "\"wifi_ssid\":\"%s\",\"mqtt_host\":\"%s\",\"mqtt_user\":\"%s\",\"mqtt_topic\":\"%s\"}",
         g_baro_pressure_hpa_x100 >= 0 ? (double)g_baro_pressure_hpa_x100 / 100.0 : -1.0,
         g_tank_pressure_hpa_x100 >= 0 ? (double)g_tank_pressure_hpa_x100 / 100.0 : -1.0,
-        g_external_temp_c_x100 != INT16_MIN ? (double)g_external_temp_c_x100 / 100.0 : -99.99,
+        g_air_temp_c_x100 != INT16_MIN ? (double)g_air_temp_c_x100 / 100.0 : -99.99,
         g_water_temp_c_x100 != INT16_MIN ? (double)g_water_temp_c_x100 / 100.0 : -99.99,
         g_depth_cm, g_level_pct, g_fault, g_low_alert, g_relay_on ? "true" : "false",
         cfg.calibrated, (double)cfg.air_offset_hpa_x100 / 100.0,
@@ -755,7 +800,7 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "</style></head><body><main><h1>Tank Controller Setup</h1>"
         "<section><h2>Live Sensor Check</h2><div class=grid>"
         "<div class=v>Baro <b id=baro>-</b> hPa</div><div class=v>Tank <b id=tank>-</b> hPa</div>"
-        "<div class=v>Reference temp <b id=exttemp>-</b> C</div><div class=v>Tank temp <b id=watertemp>-</b> C</div>"
+        "<div class=v>Air temp <b id=airtemp>-</b> C</div><div class=v>Water temp <b id=watertemp>-</b> C</div>"
         "<div class=v>Depth <b id=depth>-</b> cm</div><div class=v>Low alert <b id=lowalert>-</b></div>"
         "<div class=v>Relay <b id=relay>-</b></div><div class=v>Fault <b id=fault>-</b></div>"
         "<div class=v>Lockout <b id=lockstat>-</b></div><div class=v>Clock <b id=clockstat>-</b></div>"
@@ -768,7 +813,7 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "<label>Full level cm<input id=full type=number></label>"
         "<label>Tank height cm<input id=height type=number></label><label>Density kg/m3<input id=density type=number></label>"
         "<label>Mode<select id=mode><option value=0>auto</option><option value=1>force on</option><option value=2>force off</option></select></label>"
-        "<label>Connectivity<select id=conn><option value=255>choose</option><option value=0>standalone</option><option value=1>zigbee</option><option value=2>local wifi</option></select></label>"
+        "<label id=connfield>Connectivity<select id=conn><option value=255>choose</option><option value=0>standalone</option><option value=1>zigbee</option><option value=2>local wifi</option></select></label>"
         "<label>Pump lockout<select id=lock><option value=0>off</option><option value=1>on</option></select></label>"
         "</div><p id=lockhint class=hint></p><div id=locktimes class=row>"
         "<label>Lockout start<input id=lstart type=time></label><label>Lockout end<input id=lend type=time></label>"
@@ -781,21 +826,21 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "<label>Page login password (user: admin)<input id=webpass type=password autocomplete=off placeholder='set a new password'></label></section>"
         "<section><h2>Save</h2><p id=cal2 class=warn></p><p id=connhint class=warn></p><p id=rulehint class=hint></p>"
         "<button onclick=save()>Save parameters</button> <button onclick=saveReboot()>Save &amp; reboot</button></section>"
-        "<p id=msg></p><p class=hint>Hold button 3s to reopen setup. Hold 10s for factory reset.</p></main><script>"
+        "<p id=msg></p><p class=hint>BOOT: single press changes mode, double press reopens setup, triple press factory-resets.</p></main><script>"
         "const $=id=>document.getElementById(id);"
-        "let changed=new Set();let formInit=false;let calibrated=false;"
+        "let changed=new Set();let formInit=false;let calibrated=false;let connLocked=false;"
         "function pad(n){return String(n).padStart(2,'0')}function minToTime(m){m=Number(m)||0;return pad(Math.floor(m/60))+':'+pad(m%60)}function timeToMin(v){let p=(v||'00:00').split(':');return (Number(p[0])||0)*60+(Number(p[1])||0)}"
-        "function updateHints(){var c=$('conn').value;var lock=$('lock').value;$('wifisec').style.display=(c=='2')?'':'none';$('locktimes').style.display=(c=='2'&&lock=='1')?'':'none';"
+        "function updateHints(){var c=$('conn').value;var lock=$('lock').value;$('connfield').style.display=connLocked?'none':'';$('wifisec').style.display=(c=='2')?'':'none';$('locktimes').style.display=(c=='2'&&lock=='1')?'':'none';"
         "$('lockhint').textContent=(c=='1')?'Zigbee mode: Home Assistant controls pump lockout.':(c=='2')?'Local WiFi mode: lockout uses the schedule below.':'Standalone mode: lockout is a manual pump inhibit.';"
-        "$('connhint').textContent=(c=='1')?'Zigbee selected: AP will disappear and the device will join Zigbee.':(c=='2')?'Local WiFi selected: AP will disappear; setup moves to the local WiFi address.':(c=='0')?'Standalone selected: AP will disappear; hold button 3s to reopen setup.':'Choose a connectivity option, then Save & reboot.';"
+        "$('connhint').textContent=connLocked?'Connectivity is locked to '+(c=='2'?'local WiFi':c=='1'?'Zigbee':'standalone')+'. Factory reset is required to change it.':(c=='1')?'Zigbee selected: AP will disappear and the device will join Zigbee.':(c=='2')?'Local WiFi selected: AP will disappear; setup moves to the local WiFi address.':(c=='0')?'Standalone selected: AP will disappear; double-press BOOT to reopen setup.':'Choose a connectivity option, then Save & reboot.';"
         "validateLocal()}"
         "function validateLocal(){let lo=Number($('low').value),op=Number($('op').value),fu=Number($('full').value),hi=Number($('height').value);let ok=lo>=0&&op>=lo&&fu>op&&fu<=hi+20;$('rulehint').textContent=ok?'Level order looks valid.':'Check level order: low <= operating < full <= tank height.';$('rulehint').className=ok?'hint':'hint bad';return ok}"
         "function bindEdits(){['low','op','full','height','density','mode','conn','lock','lstart','lend','ssid','wpass','mh','mu','mp','mt','webpass'].forEach(id=>{$(id).oninput=()=>{changed.add(id);updateHints()};$(id).onchange=()=>{changed.add(id);updateHints()}})}"
-        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;$('lock').value=s.lockout_enabled;$('lstart').value=minToTime(s.lockout_start_min);$('lend').value=minToTime(s.lockout_end_min);$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';updateHints();changed.clear()}"
+        "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;connLocked=s.conn_mode!=255;$('lock').value=s.lockout_enabled;$('lstart').value=minToTime(s.lockout_start_min);$('lend').value=minToTime(s.lockout_end_min);$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';updateHints();changed.clear()}"
         "async function refresh(){let s=await(await fetch('/api/status')).json();syncForm(s)}"
         "async function load(){let r=await fetch('/api/status');let s=await r.json();"
         "$('baro').textContent=s.baro_hpa.toFixed(2);$('tank').textContent=s.tank_hpa.toFixed(2);$('depth').textContent=s.depth_cm;$('fault').textContent=s.fault;"
-        "$('exttemp').textContent=s.external_temp_c.toFixed(2);$('watertemp').textContent=s.water_temp_c.toFixed(2);"
+        "$('airtemp').textContent=s.air_temp_c.toFixed(2);$('watertemp').textContent=s.water_temp_c.toFixed(2);"
         "$('lowalert').textContent=s.low_alert?'ON':'OFF';$('relay').textContent=s.relay?'ON':'OFF';"
         "$('lockstat').textContent=s.lockout_active?'ON':'off';$('clockstat').textContent=s.time_valid?'synced':'not synced';"
         "$('wifistat').textContent=s.wifi_connected?'connected':'off';$('mqttstat').textContent=s.mqtt_connected?'connected':'off';"
@@ -805,7 +850,7 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "async function post(u){let r=await fetch(u,{method:'POST'});$('calmsg').textContent=await r.text();$('calmsg').className=r.ok?'ok':'bad';refresh()}"
         "async function calPost(u,msg){if(calibrated&&!confirm(msg))return;await post(u)}"
         "async function save(){let p=new URLSearchParams();changed.forEach(id=>{let v=$(id).value;if(id=='lstart'||id=='lend')v=timeToMin(v);p.append(id,v)});let r=await fetch('/api/config',{method:'POST',body:p});$('msg').textContent=await r.text();if(r.ok){$('wpass').value='';$('mp').value='';$('webpass').value='';refresh()}return r.ok}"
-        "async function saveReboot(){let mode=$('conn').value;let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent=(mode=='2')?'Saved - rebooting; this AP will disappear and the page will move to local WiFi.':(mode=='1')?'Saved - rebooting; this AP will disappear and the device will join Zigbee.':'Saved - rebooting; this AP will disappear. Hold button 3s to reopen setup.'}}"
+        "async function saveReboot(){let mode=$('conn').value;let ok=await save();if(ok){await fetch('/api/reboot',{method:'POST'});$('msg').textContent=(mode=='2')?'Saved - rebooting; this AP will disappear and the page will move to local WiFi.':(mode=='1')?'Saved - rebooting; this AP will disappear and the device will join Zigbee.':'Saved - rebooting; this AP will disappear. Double-press BOOT to reopen setup.'}}"
         "bindEdits();load();setInterval(load,3000)</script></body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -868,6 +913,7 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     cfg_t cfg = g_cfg;
     xSemaphoreGive(g_cfg_mtx);
 
+    uint8_t saved_conn_mode = cfg.conn_mode;
     char form[900] = "";
     if (req->content_len > 0) {
         esp_err_t err = read_request_body(req, form, sizeof(form));
@@ -914,6 +960,10 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     if (s_web_auth && !cfg.web_pass_changed) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
             "Set a new page password (admin login) before saving over WiFi");
+    }
+    if (saved_conn_mode != CONN_UNSET && cfg.conn_mode != saved_conn_mode) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "Connectivity mode is locked; factory reset is required to change it");
     }
 
     const char *bad = cfg_validate(&cfg, true);
@@ -1140,8 +1190,8 @@ static void factory_reset(void)
 }
 
 /* ----------------------------- button task ------------------------------ */
-/* runs in ALL modes. short press: cycle AUTO -> FORCE_ON -> FORCE_OFF -> AUTO.
- * service hold: temporary setup AP. full hold: factory reset (config + Zigbee). */
+/* Runs in all modes. Actions happen only after release, so a factory reset
+ * cannot reboot while the BOOT strapping pin is held low. */
 static void button_task(void *arg)
 {
     gpio_config_t io = {
@@ -1153,14 +1203,14 @@ static void button_task(void *arg)
     };
     gpio_config(&io);
 
-    /* If BOOT is still held from startup, wait for release first so it isn't
-     * mistaken for a runtime service/reset hold. */
+    /* A BOOT hold during reset selects the ROM downloader. If application code
+     * does start with the pin low, ignore it until it has been released. */
     while (gpio_get_level(BUTTON_GPIO) == 0) vTaskDelay(pdMS_TO_TICKS(20));
 
     bool prev_down = false;
     int64_t press_us = 0;
-    bool service_fired = false;
-    bool reset_fired = false;
+    int64_t last_release_us = 0;
+    uint8_t click_count = 0;
 
     while (1) {
         bool down = (gpio_get_level(BUTTON_GPIO) == 0);   /* active low */
@@ -1168,24 +1218,34 @@ static void button_task(void *arg)
 
         if (down && !prev_down) {
             press_us = now;
-            service_fired = false;
-            reset_fired = false;
-        } else if (down && !service_fired &&
-                   (now - press_us) >= (int64_t)BUTTON_SERVICE_AP_MS * 1000) {
+        } else if (!down && prev_down) {
+            int64_t held_us = now - press_us;
+            if (held_us >= (int64_t)BUTTON_DEBOUNCE_MS * 1000 &&
+                held_us <= (int64_t)BUTTON_CLICK_MAX_MS * 1000) {
+                click_count++;
+                last_release_us = now;
+
+                if (click_count >= 3) {
+                    click_count = 0;
+                    ESP_LOGW(TAG, "button triple-click -> full factory reset");
+                    factory_reset();             /* BOOT is released before reboot */
+                }
+            } else {
+                click_count = 0;                 /* ignore bounce and long holds */
+            }
+        } else if (!down && click_count > 0 &&
+                   (now - last_release_us) >= (int64_t)BUTTON_MULTI_CLICK_MS * 1000) {
+            uint8_t clicks = click_count;
+            click_count = 0;
+
+            if (clicks == 2) {
 #if SETUP_PORTAL_ENABLE
-            ESP_LOGW(TAG, "service hold -> temporary setup AP");
-            setup_portal_start();
+                ESP_LOGW(TAG, "button double-click -> temporary setup AP");
+                setup_portal_start();
 #else
-            ESP_LOGW(TAG, "service hold ignored: setup portal disabled");
+                ESP_LOGW(TAG, "button double-click ignored: setup portal disabled");
 #endif
-            service_fired = true;
-        } else if (down && !reset_fired &&
-                   (now - press_us) >= (int64_t)BUTTON_FACTORY_RESET_MS * 1000) {
-            ESP_LOGW(TAG, "factory reset hold -> full factory reset");
-            reset_fired = true;
-            factory_reset();                 /* clears config + Zigbee, reboots */
-        } else if (!down && prev_down && !service_fired && !reset_fired) {
-            if ((now - press_us) >= (int64_t)BUTTON_DEBOUNCE_MS * 1000) {
+            } else {
                 uint8_t m;
                 xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
                 g_cfg.mode = (g_cfg.mode + 1) % 3;   /* AUTO/ON/OFF */
@@ -1193,7 +1253,7 @@ static void button_task(void *arg)
                 xSemaphoreGive(g_cfg_mtx);
                 cfg_save();
                 zb_push_mode(m);
-                ESP_LOGI(TAG, "button -> mode %u (0=auto 1=on 2=off)", m);
+                ESP_LOGI(TAG, "button single-click -> mode %u (0=auto 1=on 2=off)", m);
             }
         }
 
@@ -1283,7 +1343,7 @@ static void control_task(void *arg)
         g_tank_pressure_hpa = tank_rd ? (int16_t)lroundf(p_tank) : -1;
         g_baro_pressure_hpa_x100 = baro_rd ? (int32_t)lroundf(p_baro * 100.0f) : -1;
         g_tank_pressure_hpa_x100 = tank_rd ? (int32_t)lroundf(p_tank * 100.0f) : -1;
-        g_external_temp_c_x100 = baro_rd ? (int16_t)lroundf(t_baro * 100.0f) : INT16_MIN;
+        g_air_temp_c_x100 = baro_rd ? (int16_t)lroundf(t_baro * 100.0f) : INT16_MIN;
         g_water_temp_c_x100 = tank_rd ? (int16_t)lroundf(t_tank * 100.0f) : INT16_MIN;
         bool level_ok = false;     /* true only when a real water level is known */
 
@@ -1401,6 +1461,7 @@ static esp_ota_handle_t s_ota_handle = 0;
 static const esp_partition_t *s_ota_part = NULL;
 static StreamBufferHandle_t s_ota_sb = NULL;
 static uint32_t s_ota_bytes = 0;
+static uint32_t s_ota_rx_bytes = 0;
 static uint32_t s_ota_skip  = 0;            /* sub-element header bytes to drop  */
 static volatile bool s_ota_finish = false;
 static volatile bool s_ota_failed = false;
@@ -1411,15 +1472,6 @@ static volatile bool s_ota_failed = false;
  * the Zigbee stack is never stalled (esp_ota_write inside the callback -> zb_assert). */
 static void ota_writer_task(void *arg)
 {
-    s_ota_part = esp_ota_get_next_update_partition(NULL);
-    esp_err_t err = s_ota_part ? esp_ota_begin(s_ota_part, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle)
-                               : ESP_ERR_NOT_FOUND;
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
-        s_ota_failed = true; s_ota_active = false;
-        vTaskDelete(NULL);
-        return;
-    }
     ESP_LOGI(TAG, "OTA writer -> %s", s_ota_part->label);
 
     uint8_t buf[512];
@@ -1448,18 +1500,43 @@ static void ota_writer_task(void *arg)
 
 static esp_err_t ota_value_cb(esp_zb_zcl_ota_upgrade_value_message_t msg)
 {
+    if (msg.info.status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "OTA callback status 0x%x", msg.info.status);
+        return ESP_FAIL;
+    }
     switch (msg.upgrade_status) {
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
         if (s_ota_active) break;
         s_ota_bytes = 0;
+        s_ota_rx_bytes = 0;
         s_ota_skip = OTA_SUBELEMENT_HDR;
         s_ota_finish = false;
         s_ota_failed = false;
+        s_ota_part = esp_ota_get_next_update_partition(NULL);
+        esp_err_t err = s_ota_part
+            ? esp_ota_begin(s_ota_part, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle)
+            : ESP_ERR_NOT_FOUND;
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
+            s_ota_failed = true;
+            return err;
+        }
         if (!s_ota_sb) s_ota_sb = xStreamBufferCreate(16384, 1);
-        if (!s_ota_sb) { s_ota_failed = true; break; }
+        if (!s_ota_sb) {
+            esp_ota_abort(s_ota_handle);
+            s_ota_handle = 0;
+            s_ota_failed = true;
+            return ESP_ERR_NO_MEM;
+        }
         xStreamBufferReset(s_ota_sb);
         s_ota_active = true;
-        xTaskCreate(ota_writer_task, "ota_wr", 8192, NULL, 4, NULL);
+        if (xTaskCreate(ota_writer_task, "ota_wr", 8192, NULL, 4, NULL) != pdPASS) {
+            esp_ota_abort(s_ota_handle);
+            s_ota_handle = 0;
+            s_ota_active = false;
+            s_ota_failed = true;
+            return ESP_ERR_NO_MEM;
+        }
         ESP_LOGI(TAG, "OTA start (img ver 0x%08x)", (unsigned)msg.ota_header.file_version);
         break;
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
@@ -1470,7 +1547,18 @@ static esp_err_t ota_value_cb(esp_zb_zcl_ota_upgrade_value_message_t msg)
                 uint16_t s = s_ota_skip < n ? s_ota_skip : n;
                 p += s; n -= s; s_ota_skip -= s;
             }
-            if (n) xStreamBufferSend(s_ota_sb, p, n, pdMS_TO_TICKS(200));
+            if (n) {
+                uint32_t before = s_ota_rx_bytes;
+                if (xStreamBufferSend(s_ota_sb, p, n, pdMS_TO_TICKS(200)) != n) {
+                    ESP_LOGE(TAG, "OTA receive queue full");
+                    s_ota_failed = true;
+                    return ESP_ERR_NO_MEM;
+                }
+                s_ota_rx_bytes += n;
+                if (before == 0 || (before >> 16) != (s_ota_rx_bytes >> 16)) {
+                    ESP_LOGI(TAG, "OTA received %u bytes", (unsigned)s_ota_rx_bytes);
+                }
+            }
         }
         break;
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY:
@@ -1490,10 +1578,88 @@ static esp_err_t ota_value_cb(esp_zb_zcl_ota_upgrade_value_message_t msg)
     return ESP_OK;
 }
 
+static void ota_match_desc_cb(esp_zb_zdp_status_t status, uint16_t addr,
+                              uint8_t endpoint, void *user_ctx)
+{
+    (void)user_ctx;
+    if (status != ESP_ZB_ZDP_STATUS_SUCCESS || s_ota_active) {
+        ESP_LOGW(TAG, "OTA server discovery failed (status=0x%x)", status);
+        return;
+    }
+    esp_zb_ota_upgrade_client_query_interval_set(ZB_ENDPOINT, OTA_QUERY_INTERVAL_S);
+    esp_err_t err = esp_zb_ota_upgrade_client_query_image_req(addr, endpoint);
+    ESP_LOGI(TAG, "OTA server 0x%04x ep%u, query -> %s",
+             addr, endpoint, esp_err_to_name(err));
+}
+
+static void ota_discover_server_cb(uint8_t arg)
+{
+    (void)arg;
+    if (!g_zb_joined || s_ota_active) return;
+
+    static uint16_t clusters[] = {ESP_ZB_ZCL_CLUSTER_ID_OTA_UPGRADE};
+    esp_zb_zdo_match_desc_req_param_t req = {
+        .addr_of_interest = 0x0000,
+        .dst_nwk_addr = 0x0000,
+        .num_in_clusters = 1,
+        .num_out_clusters = 0,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_list = clusters,
+    };
+    esp_err_t err = esp_zb_zdo_match_cluster(&req, ota_match_desc_cb, NULL);
+    ESP_LOGI(TAG, "OTA server discovery -> %s", esp_err_to_name(err));
+}
+
 /* --------------------------- Zigbee write handler ----------------------- */
 static esp_err_t zb_set_attr_cb(const esp_zb_zcl_set_attr_value_message_t *m)
 {
+    if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT &&
+        m->attribute.id == ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID) {
+        float raw = *(float *)m->attribute.data.value;
+        if (!isfinite(raw)) return ESP_ERR_INVALID_ARG;
+
+        xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+        cfg_t next = g_cfg;
+        bool handled = true;
+        switch (m->info.dst_endpoint) {
+            case ZB_EP_SET_LOW:        next.low_cm = (int16_t)lroundf(raw); break;
+            case ZB_EP_SET_OPERATING:  next.operating_cm = (int16_t)lroundf(raw); break;
+            case ZB_EP_SET_FULL:       next.full_cm = (int16_t)lroundf(raw); break;
+            case ZB_EP_SET_TANK_HEIGHT:next.tank_h_cm = (int16_t)lroundf(raw); break;
+            case ZB_EP_SET_DENSITY:    next.density = (uint16_t)lroundf(raw); break;
+            case ZB_EP_SET_MODE:       next.mode = (uint8_t)lroundf(raw); break;
+            default: handled = false; break;
+        }
+        const char *bad = handled ? cfg_validate(&next, false) : "unknown_endpoint";
+        if (!bad) g_cfg = next;
+        cfg_t snap = g_cfg;
+        xSemaphoreGive(g_cfg_mtx);
+
+        if (bad) {
+            ESP_LOGW(TAG, "Zigbee standard setting rejected (%s): ep=%u value=%.2f",
+                     bad, m->info.dst_endpoint, (double)raw);
+        } else {
+            cfg_save();
+            ESP_LOGI(TAG, "Zigbee setting: low=%d operating=%d full=%d tankH=%d rho=%u mode=%u",
+                     snap.low_cm, snap.operating_cm, snap.full_cm, snap.tank_h_cm,
+                     snap.density, snap.mode);
+        }
+        return ESP_OK;
+    }
+
     if (m->info.dst_endpoint != ZB_ENDPOINT) return ESP_OK;
+
+    if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+        m->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+        uint8_t lockout = *(uint8_t *)m->attribute.data.value ? 1 : 0;
+        xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+        g_cfg.lockout_enabled = lockout;
+        xSemaphoreGive(g_cfg_mtx);
+        cfg_save();
+        ESP_LOGI(TAG, "Zigbee AUTO lockout -> %s", lockout ? "ON" : "OFF");
+        return ESP_OK;
+    }
+
     if (m->info.cluster != ZB_CUSTOM_CLUSTER_ID) return ESP_OK;
 
     xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
@@ -1535,8 +1701,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t cb_id, const
     } else if (cb_id == ESP_ZB_CORE_OTA_UPGRADE_QUERY_IMAGE_RESP_CB_ID) {
         const esp_zb_zcl_ota_upgrade_query_image_resp_message_t *m =
             (const esp_zb_zcl_ota_upgrade_query_image_resp_message_t *)message;
-        ESP_LOGI(TAG, "OTA query response: status=%d version=0x%08x size=%u",
-                 m->query_status, (unsigned)m->file_version, (unsigned)m->image_size);
+        ESP_LOGI(TAG, "OTA query response: status=%d server=0x%04x ep%u version=0x%08x size=%u",
+                 m->query_status, m->server_addr.u.short_addr, m->server_endpoint,
+                 (unsigned)m->file_version, (unsigned)m->image_size);
     }
     return ESP_OK;
 }
@@ -1565,10 +1732,12 @@ static void add_custom_cluster(esp_zb_cluster_list_t *list)
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_LOW_ALERT, ESP_ZB_ZCL_ATTR_TYPE_U8,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &u8);
     s16 = INT16_MIN;
-    esp_zb_custom_cluster_add_custom_attr(c, ATTR_EXTERNAL_TEMP_CX100, ESP_ZB_ZCL_ATTR_TYPE_S16,
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_AIR_TEMP_CX100, ESP_ZB_ZCL_ATTR_TYPE_S16,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &s16);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_WATER_TEMP_CX100, ESP_ZB_ZCL_ATTR_TYPE_S16,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &s16);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_RELAY_STATE, ESP_ZB_ZCL_ATTR_TYPE_U8,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &u8);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_LOCKOUT_ACTIVE, ESP_ZB_ZCL_ATTR_TYPE_U8,
         ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &u8);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_TIME_VALID, ESP_ZB_ZCL_ATTR_TYPE_U8,
@@ -1613,6 +1782,23 @@ static void add_analog_input_ep(esp_zb_ep_list_t *ep_list, uint8_t endpoint)
     esp_zb_attribute_list_t *ai = esp_zb_analog_input_cluster_create(&cfg);
     esp_zb_cluster_list_t *cl = esp_zb_zcl_cluster_list_create();
     esp_zb_cluster_list_add_analog_input_cluster(cl, ai, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_endpoint_config_t epc = {
+        .endpoint = endpoint, .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID, .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, cl, epc);
+}
+
+/* Standard writable PresentValue endpoint. The endpoint number supplies the
+ * tank-specific meaning while the wire protocol remains ordinary Zigbee ZCL. */
+static void add_analog_output_ep(esp_zb_ep_list_t *ep_list, uint8_t endpoint, float initial)
+{
+    esp_zb_analog_output_cluster_cfg_t cfg = {
+        .out_of_service = 0, .present_value = initial, .status_flags = 0,
+    };
+    esp_zb_attribute_list_t *ao = esp_zb_analog_output_cluster_create(&cfg);
+    esp_zb_cluster_list_t *cl = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_analog_output_cluster(cl, ao, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_endpoint_config_t epc = {
         .endpoint = endpoint, .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
         .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID, .app_device_version = 0,
@@ -1687,18 +1873,18 @@ static void esp_zb_task(void *arg)
         .ota_upgrade_downloaded_file_ver = OTA_FW_VERSION,
         .ota_upgrade_manufacturer = OTA_MANUF_CODE,
         .ota_upgrade_image_type = OTA_IMAGE_TYPE,
-        .ota_min_block_reque = 0,
-        .ota_upgrade_file_offset = ESP_ZB_ZCL_OTA_UPGRADE_FILE_OFFSET_DEF_VALUE,
-        .ota_upgrade_server_id = ESP_ZB_ZCL_OTA_UPGRADE_SERVER_DEF_VALUE,
-        .ota_image_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_IMAGE_STATUS_DEF_VALUE,
     };
     esp_zb_attribute_list_t *ota = esp_zb_ota_cluster_create(&ota_cfg);
     esp_zb_zcl_ota_upgrade_client_variable_t ota_var = {
-        .timer_query = OTA_QUERY_INTERVAL_MIN,
+        .timer_query = ESP_ZB_ZCL_OTA_UPGRADE_QUERY_TIMER_COUNT_DEF,
         .hw_version = OTA_HW_VERSION,
         .max_data_size = OTA_MAX_DATA_SIZE,
     };
+    uint16_t ota_server_addr = 0xffff;
+    uint8_t ota_server_ep = 0xff;
     esp_zb_ota_cluster_add_attr(ota, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_CLIENT_DATA_ID, &ota_var);
+    esp_zb_ota_cluster_add_attr(ota, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_SERVER_ADDR_ID, &ota_server_addr);
+    esp_zb_ota_cluster_add_attr(ota, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_SERVER_ENDPOINT_ID, &ota_server_ep);
     esp_zb_cluster_list_add_ota_cluster(clusters, ota, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
@@ -1715,7 +1901,19 @@ static void esp_zb_task(void *arg)
     add_analog_input_ep(ep_list, ZB_EP_DEPTH);
     add_analog_input_ep(ep_list, ZB_EP_LEVEL);
     add_temp_meas_ep(ep_list, ZB_EP_WATER_TEMP);
-    add_temp_meas_ep(ep_list, ZB_EP_EXT_TEMP);
+    add_temp_meas_ep(ep_list, ZB_EP_AIR_TEMP);
+    add_analog_input_ep(ep_list, ZB_EP_FAULT);
+    add_analog_input_ep(ep_list, ZB_EP_BARO_PRESSURE);
+    add_analog_input_ep(ep_list, ZB_EP_TANK_PRESSURE);
+    add_analog_input_ep(ep_list, ZB_EP_LOW_ALERT);
+    add_analog_input_ep(ep_list, ZB_EP_RELAY);
+    add_analog_input_ep(ep_list, ZB_EP_MODE);
+    add_analog_output_ep(ep_list, ZB_EP_SET_LOW, (float)g_cfg.low_cm);
+    add_analog_output_ep(ep_list, ZB_EP_SET_OPERATING, (float)g_cfg.operating_cm);
+    add_analog_output_ep(ep_list, ZB_EP_SET_FULL, (float)g_cfg.full_cm);
+    add_analog_output_ep(ep_list, ZB_EP_SET_TANK_HEIGHT, (float)g_cfg.tank_h_cm);
+    add_analog_output_ep(ep_list, ZB_EP_SET_DENSITY, (float)g_cfg.density);
+    add_analog_output_ep(ep_list, ZB_EP_SET_MODE, (float)g_cfg.mode);
 
     esp_zb_device_register(ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
@@ -1754,6 +1952,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
                 ESP_LOGI(TAG, "rejoined existing network");
                 g_zb_joined = true;
                 g_join_us = esp_timer_get_time();
+                esp_zb_scheduler_alarm(ota_discover_server_cb, 0, 5000);
             }
         } else {
             ESP_LOGW(TAG, "init failed (%s), retrying", esp_err_to_name(err));
@@ -1768,6 +1967,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *sig)
             esp_zb_get_long_address(ext);
             ESP_LOGI(TAG, "joined, PAN 0x%04hx, ch %d", esp_zb_get_pan_id(),
                      esp_zb_get_current_channel());
+            esp_zb_scheduler_alarm(ota_discover_server_cb, 0, 5000);
         } else {
             ESP_LOGW(TAG, "no network found, retrying steering");
             esp_zb_scheduler_alarm(zb_commissioning_alarm_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);

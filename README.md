@@ -50,14 +50,17 @@ anti-short-cycle: min 30 s rest before the pump can restart (AUTO only)
 
 ## Onboard BOOT button (GPIO28) — local override
 
-- **Short press** — cycle mode **AUTO → FORCE ON → FORCE OFF → AUTO**. The new
+- **Single press** — cycle mode **AUTO → FORCE ON → FORCE OFF → AUTO**. The new
   mode is saved to NVS and pushed to Zigbee, so the hub's `mode` stays in sync.
   FORCE modes act immediately (they bypass the anti-short-cycle).
-- **Long press (≥ 5 s)** — Zigbee factory reset: the device leaves the network
-  and reboots ready to re-commission. No re-flash needed.
+- **Double press** — start the temporary setup AP. In standalone mode this is
+  how the configuration page is reopened after setup.
+- **Triple press** — full factory reset: clear saved configuration and Zigbee
+  network data, then reboot into initial setup mode.
 
-(The button is also the firmware-download strapping pin, but that only matters
-while resetting the board — runtime use is safe.)
+Actions run after BOOT is released. This matters because BOOT is also the
+firmware-download strapping pin; resetting while it is held enters the ROM
+bootloader instead of the application.
 
 ## Build & flash (do this **before** plugging the device into mains)
 
@@ -78,9 +81,14 @@ managed components automatically (see `main/idf_component.yml`).
 1. Copy `zigbee2mqtt/firebeetle_tank.js` to your Z2M
    `data/external_converters/` folder and restart Z2M.
 2. Enable "permit join", power the device — it advertises as **DIY / ESP32C5**.
-3. In the device page you'll get: `state` (pump), `depth`, `level`, `fault`,
-   `low_alert`, `baro_pressure`, `tank_pressure`, and settable `level_low`,
-   `operating_level`, `level_full`, `tank_height`, `density`, `mode`.
+3. In the device page you'll get: `state` (AUTO lockout switch), `relay`, `depth`, `level`, `fault`,
+   `low_alert`, both pressures and temperatures, and settable `low_alert_cm`,
+   `operating_cm`, `full_cm`, `tank_height_cm`, `density`, and `mode`.
+
+Live values use standard Analog Input / Temperature Measurement endpoints. Numeric
+settings use standard writable Analog Output endpoints, and `state` uses standard
+On/Off. The converter only gives those endpoints tank-specific names. After a
+firmware update that changes endpoints, re-pair the device so Z2M interviews them.
 
 To re-commission later, erase and re-flash, or send it through a factory reset
 (clear via `idf.py erase-flash`).
@@ -91,6 +99,9 @@ From the setup AP, choose **local wifi**, enter the WiFi SSID/password, and
 optionally enter an MQTT broker host/IP, user, password, and base topic. On the
 next boot the device joins WiFi, serves the same setup/control page on its LAN
 IP, and publishes MQTT state to:
+
+Once standalone, Zigbee, or local WiFi is selected, connectivity is hidden and
+locked. A factory reset is required to choose a different connectivity mode.
 
 ```
 tank/controller/state
