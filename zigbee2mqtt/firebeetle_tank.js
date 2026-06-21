@@ -73,6 +73,13 @@ const fzTempEp = {
     },
 };
 
+const fzLockout = {
+    cluster: 'genOnOff',
+    type: ['attributeReport', 'readResponse'],
+    convert: (model, msg) => msg.data.onOff === undefined ? {} :
+        {lockout: msg.data.onOff ? 'ON' : 'OFF'},
+};
+
 // settable config attributes
 const tzTank = {
     key: Object.keys(OUTPUT_EP),
@@ -100,6 +107,21 @@ const tzTankRead = {
     },
 };
 
+const tzLockout = {
+    key: ['lockout'],
+    convertSet: async (entity, key, value, meta) => {
+        const lockout = String(value).toUpperCase();
+        if (lockout !== 'ON' && lockout !== 'OFF') {
+            throw new Error(`Invalid lockout value: ${value}`);
+        }
+        await tz.on_off.convertSet(entity, 'state', lockout, meta);
+        return {state: {lockout}};
+    },
+    convertGet: async (entity, key, meta) => {
+        await tz.on_off.convertGet(entity, 'state', meta);
+    },
+};
+
 module.exports = [
     {
         zigbeeModel: ['ESP32C5'],
@@ -107,10 +129,10 @@ module.exports = [
         vendor: 'DIY',
         description: 'FireBeetle 2 ESP32-C5 underwater tank level / fill relay',
         ota: true,                 // enable wireless firmware updates (served from the OTA override index)
-        fromZigbee: [fz.on_off, fzAnalogInput, fzAnalogOutput, fzTempEp],
+        fromZigbee: [fzLockout, fzAnalogInput, fzAnalogOutput, fzTempEp],
         // The standard on/off switch controls AUTO lockout. It does not drive
         // the relay; AUTO/force behavior remains owned by the firmware.
-        toZigbee: [tz.on_off, tzTank, tzTankRead],
+        toZigbee: [tzLockout, tzTank, tzTankRead],
         configure: async (device, coordinatorEndpoint) => {
             const ep = device.getEndpoint(10);
             try {
@@ -149,7 +171,8 @@ module.exports = [
             }
         },
         exposes: [
-            e.switch().withDescription('Pump lockout in AUTO mode; force modes remain available'),
+            e.binary('lockout', ea.ALL, 'ON', 'OFF')
+                .withDescription('Pump lockout in AUTO mode; force modes remain available'),
             e.binary('relay', ea.STATE_GET, 'ON', 'OFF')
                 .withDescription('Controller-owned pump relay output'),
             e.numeric('depth', ea.STATE_GET).withUnit('cm').withDescription('Water depth above sensor'),
