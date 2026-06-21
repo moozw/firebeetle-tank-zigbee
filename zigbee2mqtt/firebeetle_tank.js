@@ -110,15 +110,16 @@ const tzTankRead = {
 const tzLockout = {
     key: ['lockout'],
     convertSet: async (entity, key, value, meta) => {
-        const lockout = String(value).toUpperCase();
+        const lockout = value === true ? 'ON' : value === false ? 'OFF' : String(value).toUpperCase();
         if (lockout !== 'ON' && lockout !== 'OFF') {
             throw new Error(`Invalid lockout value: ${value}`);
         }
-        await tz.on_off.convertSet(entity, 'state', lockout, meta);
+        const endpoint = meta.device.getEndpoint(10);
+        await endpoint.command('genOnOff', lockout === 'ON' ? 'on' : 'off', {}, {});
         return {state: {lockout}};
     },
     convertGet: async (entity, key, meta) => {
-        await tz.on_off.convertGet(entity, 'state', meta);
+        await meta.device.getEndpoint(10).read('genOnOff', ['onOff']);
     },
 };
 
