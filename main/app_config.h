@@ -53,7 +53,10 @@
 #define SENSOR_FAULT_LIMIT      3      /* consecutive bad reads -> failsafe OFF */
 #define SENSOR_AVG_SAMPLES      3      /* one-shot readings per displayed sample */
 #define SENSOR_AVG_DELAY_MS     250    /* rest between one-shot conversions      */
+#define SENSOR_MIN_VALID_HPA    300.0f /* lower values are missed/invalid reads   */
+#define SENSOR_MAX_DROP_CM      50     /* larger one-cycle drops are bad reads    */
 #define MAX_DEPTH_OVER_TANK_CM  20     /* depth above tank height => fault       */
+#define FULL_INHIBIT_CLEAR_READINGS 5  /* fresh <100% reads before pump can run  */
 #define BENCH_REQUIRE_EQUAL_PRESSURE 0  /* setup calibration now handles offsets  */
 #define BENCH_MAX_DELTA_HPA     10.0f  /* both sensors in air should be close    */
 #define PUMP_MIN_OFF_MS         30000  /* anti-short-cycle: min rest before re-ON */
@@ -148,7 +151,7 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x01000027   /* 1.0.0.39 - batched OTA flash writes */
+#define OTA_FW_VERSION      0x01000029   /* 1.0.0.41 - raw sensor endpoint */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101

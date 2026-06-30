@@ -105,7 +105,14 @@ static cfg_t g_cfg = {
     .web_pass_changed = 0,
 };
 static SemaphoreHandle_t g_cfg_mtx;
+static SemaphoreHandle_t g_sensor_mtx;
+static i2c_master_bus_handle_t g_sensor_bus;
+static lps2x_t g_baro_sensor;
+static lps2x_t g_tank_sensor;
+static bool g_baro_sensor_ok = false;
+static bool g_tank_sensor_ok = false;
 static void cfg_save(void);
+static bool sensor_pressure_valid(float hpa);
 
 static const cfg_t DEFAULT_CFG = {
     .magic     = 0x544b,
@@ -141,7 +148,7 @@ static const char *cfg_validate(const cfg_t *cfg, bool require_wifi_ssid)
     if (cfg->operating_cm < cfg->low_cm) return "operating_below_low";
     if (cfg->full_cm <= cfg->operating_cm) return "full_below_operating";
     if (cfg->tank_h_cm < 10 || cfg->tank_h_cm > 1000) return "tank_height";
-    if (cfg->full_cm > cfg->tank_h_cm + MAX_DEPTH_OVER_TANK_CM) return "full_above_tank";
+    if (cfg->full_cm > cfg->tank_h_cm) return "full_above_tank";
     if (cfg->density < 900 || cfg->density > 1100) return "density";
     if (cfg->mode > MODE_OFF) return "mode";
     if (cfg->conn_mode != CONN_UNSET && cfg->conn_mode > CONN_WIFI) return "conn_mode";
@@ -157,6 +164,24 @@ static const char *cfg_validate(const cfg_t *cfg, bool require_wifi_ssid)
     if (cfg->web_pass_changed > 1) return "web_pass_changed";
     if (cfg->web_pass[sizeof(cfg->web_pass) - 1] != '\0') return "web_pass_terminated";
     return NULL;
+}
+
+static bool cfg_clamp_level_safety(cfg_t *cfg)
+{
+    bool changed = false;
+    if (cfg->tank_h_cm >= 10 && cfg->full_cm > cfg->tank_h_cm) {
+        cfg->full_cm = cfg->tank_h_cm;
+        changed = true;
+    }
+    if (cfg->operating_cm >= cfg->full_cm) {
+        cfg->operating_cm = cfg->full_cm > 0 ? cfg->full_cm - 1 : 0;
+        changed = true;
+    }
+    if (cfg->low_cm > cfg->operating_cm) {
+        cfg->low_cm = cfg->operating_cm;
+        changed = true;
+    }
+    return changed;
 }
 
 /* live telemetry (updated by control task) */
@@ -209,6 +234,9 @@ static void cfg_load(void)
             /* web_pass/web_pass_changed already defaulted from DEFAULT_CFG since
              * they sit past the end of the older (v5) stored blob */
             g_cfg.version = 6;
+            migrated = true;
+        }
+        if (err == ESP_OK && cfg_clamp_level_safety(&g_cfg)) {
             migrated = true;
         }
     }
@@ -351,6 +379,28 @@ static bool lockout_is_active(const cfg_t *cfg)
     g_time_valid = 0;
     g_lockout_active = 1;
     return true;
+}
+
+static bool sensor_pressure_valid(float hpa)
+{
+    return isfinite(hpa) && hpa >= SENSOR_MIN_VALID_HPA;
+}
+
+static float median_float(float *values, int count)
+{
+    for (int i = 1; i < count; i++) {
+        float v = values[i];
+        int j = i - 1;
+        while (j >= 0 && values[j] > v) {
+            values[j + 1] = values[j];
+            j--;
+        }
+        values[j + 1] = v;
+    }
+    if ((count & 1) != 0) {
+        return values[count / 2];
+    }
+    return (values[count / 2 - 1] + values[count / 2]) / 2.0f;
 }
 
 static void mqtt_publish_state(void)
@@ -786,6 +836,85 @@ static esp_err_t setup_status_get(httpd_req_t *req)
     return httpd_resp_send(req, json, n);
 }
 
+static void json_float_or_null(char *out, size_t out_len, bool ok, float value)
+{
+    if (ok) {
+        snprintf(out, out_len, "%.2f", (double)value);
+    } else {
+        strlcpy(out, "null", out_len);
+    }
+}
+
+static esp_err_t setup_raw_sensor_get(httpd_req_t *req)
+{
+    WEB_REQUIRE_AUTH(req);
+
+    cfg_t cfg;
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg = g_cfg;
+    xSemaphoreGive(g_cfg_mtx);
+
+    bool ready = false;
+    bool baro_present = false;
+    bool tank_present = false;
+    esp_err_t baro_err = ESP_ERR_INVALID_STATE;
+    esp_err_t tank_err = ESP_ERR_INVALID_STATE;
+    float p_baro = 0, t_baro = 0;
+    float p_tank = 0, t_tank = 0;
+
+    if (g_sensor_mtx && xSemaphoreTake(g_sensor_mtx, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        ready = (g_sensor_bus != NULL);
+        if (ready) {
+            baro_present = g_baro_sensor_ok;
+            tank_present = g_tank_sensor_ok;
+            baro_err = baro_present ? lps2x_read(&g_baro_sensor, &p_baro, &t_baro) : ESP_ERR_NOT_FOUND;
+            tank_err = tank_present ? lps2x_read(&g_tank_sensor, &p_tank, &t_tank) : ESP_ERR_NOT_FOUND;
+        }
+        xSemaphoreGive(g_sensor_mtx);
+    }
+
+    bool baro_ok = (baro_err == ESP_OK);
+    bool tank_ok = (tank_err == ESP_OK);
+    bool baro_valid = baro_ok && sensor_pressure_valid(p_baro);
+    bool tank_valid = tank_ok && sensor_pressure_valid(p_tank);
+    bool level_ok = baro_valid && tank_valid;
+    float delta_hpa = level_ok ? (p_tank - p_baro) - ((float)cfg.air_offset_hpa_x100 / 100.0f) : 0.0f;
+    float depth_cm = level_ok
+        ? (delta_hpa * 100.0f) / ((float)cfg.density * GRAVITY_MS2) * 100.0f + SENSOR_OFFSET_CM
+        : 0.0f;
+    if (depth_cm < 0) depth_cm = 0;
+    int pct = level_ok && cfg.tank_h_cm > 0 ? (int)lroundf(depth_cm * 100.0f / cfg.tank_h_cm) : 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    char baro_hpa[24], baro_temp[24], tank_hpa[24], tank_temp[24], delta[24], depth[24];
+    json_float_or_null(baro_hpa, sizeof(baro_hpa), baro_ok, p_baro);
+    json_float_or_null(baro_temp, sizeof(baro_temp), baro_ok, t_baro);
+    json_float_or_null(tank_hpa, sizeof(tank_hpa), tank_ok, p_tank);
+    json_float_or_null(tank_temp, sizeof(tank_temp), tank_ok, t_tank);
+    json_float_or_null(delta, sizeof(delta), level_ok, delta_hpa);
+    json_float_or_null(depth, sizeof(depth), level_ok, depth_cm);
+
+    char json[900];
+    int n = snprintf(json, sizeof(json),
+        "{\"raw\":true,\"ready\":%s,"
+        "\"baro\":{\"addr\":%u,\"present\":%s,\"ok\":%s,\"err\":\"%s\",\"hpa\":%s,\"temp_c\":%s,\"valid\":%s},"
+        "\"tank\":{\"addr\":%u,\"present\":%s,\"ok\":%s,\"err\":\"%s\",\"hpa\":%s,\"temp_c\":%s,\"valid\":%s},"
+        "\"level_ok\":%s,\"delta_hpa\":%s,\"depth_cm\":%s,\"level_pct\":%d,"
+        "\"controller_fault\":%u,\"controller_relay\":%s}",
+        ready ? "true" : "false",
+        LPS_BARO_ADDR, baro_present ? "true" : "false", baro_ok ? "true" : "false",
+        esp_err_to_name(baro_err), baro_hpa, baro_temp, baro_valid ? "true" : "false",
+        LPS_TANK_ADDR, tank_present ? "true" : "false", tank_ok ? "true" : "false",
+        esp_err_to_name(tank_err), tank_hpa, tank_temp, tank_valid ? "true" : "false",
+        level_ok ? "true" : "false", delta, depth, pct,
+        g_fault, g_relay_on ? "true" : "false");
+    if (n < 0) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Raw sensor format failed");
+    if (n >= (int)sizeof(json)) n = strlen(json);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, n);
+}
+
 static esp_err_t setup_root_get(httpd_req_t *req)
 {
     WEB_REQUIRE_AUTH(req);
@@ -834,7 +963,7 @@ static esp_err_t setup_root_get(httpd_req_t *req)
         "$('lockhint').textContent=(c=='1')?'Zigbee mode: Home Assistant controls pump lockout.':(c=='2')?'Local WiFi mode: lockout uses the schedule below.':'Standalone mode: lockout is a manual pump inhibit.';"
         "$('connhint').textContent=connLocked?'Connectivity is locked to '+(c=='2'?'local WiFi':c=='1'?'Zigbee':'standalone')+'. Factory reset is required to change it.':(c=='1')?'Zigbee selected: AP will disappear and the device will join Zigbee.':(c=='2')?'Local WiFi selected: AP will disappear; setup moves to the local WiFi address.':(c=='0')?'Standalone selected: AP will disappear; double-press BOOT to reopen setup.':'Choose a connectivity option, then Save & reboot.';"
         "validateLocal()}"
-        "function validateLocal(){let lo=Number($('low').value),op=Number($('op').value),fu=Number($('full').value),hi=Number($('height').value);let ok=lo>=0&&op>=lo&&fu>op&&fu<=hi+20;$('rulehint').textContent=ok?'Level order looks valid.':'Check level order: low <= operating < full <= tank height.';$('rulehint').className=ok?'hint':'hint bad';return ok}"
+        "function validateLocal(){let lo=Number($('low').value),op=Number($('op').value),fu=Number($('full').value),hi=Number($('height').value);let ok=lo>=0&&op>=lo&&fu>op&&fu<=hi;$('rulehint').textContent=ok?'Level order looks valid.':'Check level order: low <= operating < full <= tank height.';$('rulehint').className=ok?'hint':'hint bad';return ok}"
         "function bindEdits(){['low','op','full','height','density','mode','conn','lock','lstart','lend','ssid','wpass','mh','mu','mp','mt','webpass'].forEach(id=>{$(id).oninput=()=>{changed.add(id);updateHints()};$(id).onchange=()=>{changed.add(id);updateHints()}})}"
         "function syncForm(s){$('low').value=s.low_cm;$('op').value=s.operating_cm;$('full').value=s.full_cm;$('height').value=s.tank_height_cm;$('density').value=s.density;$('mode').value=s.mode;$('conn').value=s.conn_mode;connLocked=s.conn_mode!=255;$('lock').value=s.lockout_enabled;$('lstart').value=minToTime(s.lockout_start_min);$('lend').value=minToTime(s.lockout_end_min);$('ssid').value=s.wifi_ssid;$('mh').value=s.mqtt_host;$('mu').value=s.mqtt_user;$('mt').value=s.mqtt_topic;if(!$('wpass').value)$('wpass').placeholder='saved/blank';if(!$('mp').value)$('mp').placeholder='saved/blank';updateHints();changed.clear()}"
         "async function refresh(){let s=await(await fetch('/api/status')).json();syncForm(s)}"
@@ -1022,6 +1151,7 @@ static void web_server_start(void)
     ESP_ERROR_CHECK(httpd_start(&s_httpd, &http_cfg));
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/", .method=HTTP_GET, .handler=setup_root_get });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/status", .method=HTTP_GET, .handler=setup_status_get });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/raw_sensor", .method=HTTP_GET, .handler=setup_raw_sensor_get });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/open_air", .method=HTTP_POST, .handler=setup_open_air_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/full_tank", .method=HTTP_POST, .handler=setup_full_tank_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/config", .method=HTTP_POST, .handler=setup_config_post });
@@ -1265,24 +1395,25 @@ static void button_task(void *arg)
 /* ---------------------------- control task ------------------------------ */
 static void control_task(void *arg)
 {
-    i2c_master_bus_handle_t bus;
-    lps2x_t baro = {0}, tank = {0};
-
-    ESP_ERROR_CHECK(lps2x_bus_init(&bus));
+    ESP_ERROR_CHECK(lps2x_bus_init(&g_sensor_bus));
 
     /* one-shot I2C scan to help confirm wiring / actual sensor addresses */
     ESP_LOGI(TAG, "I2C scan on SDA=%d SCL=%d ...", I2C_SDA_GPIO, I2C_SCL_GPIO);
     int found = 0;
     for (uint8_t a = 0x08; a < 0x78; a++) {
-        if (i2c_master_probe(bus, a, 50) == ESP_OK) {
+        if (i2c_master_probe(g_sensor_bus, a, 50) == ESP_OK) {
             ESP_LOGI(TAG, "  found I2C device @ 0x%02x", a);
             found++;
         }
     }
     if (found == 0) ESP_LOGW(TAG, "  no I2C devices found (sensors connected/powered?)");
 
-    bool baro_ok = (lps2x_init(bus, LPS_BARO_ADDR, &baro) == ESP_OK);
-    bool tank_ok = (lps2x_init(bus, LPS_TANK_ADDR, &tank) == ESP_OK);
+    xSemaphoreTake(g_sensor_mtx, portMAX_DELAY);
+    g_baro_sensor_ok = (lps2x_init(g_sensor_bus, LPS_BARO_ADDR, &g_baro_sensor) == ESP_OK);
+    g_tank_sensor_ok = (lps2x_init(g_sensor_bus, LPS_TANK_ADDR, &g_tank_sensor) == ESP_OK);
+    bool baro_ok = g_baro_sensor_ok;
+    bool tank_ok = g_tank_sensor_ok;
+    xSemaphoreGive(g_sensor_mtx);
     ESP_LOGI(TAG, "sensors: baro(0x%02x)=%s  tank(0x%02x)=%s", LPS_BARO_ADDR,
              baro_ok ? "OK" : "absent", LPS_TANK_ADDR, tank_ok ? "OK" : "absent");
     if (!baro_ok && !tank_ok) ESP_LOGW(TAG, "no sensors - relay stays in failsafe OFF");
@@ -1290,6 +1421,14 @@ static void control_task(void *arg)
 
     int fault_count = 0;
     int64_t last_off_us = 0, last_on_us = 0;
+    float last_p_tank = 0, last_p_baro = 0;
+    float last_t_tank = 0, last_t_baro = 0;
+    bool have_last_tank = false, have_last_baro = false;
+    int16_t last_depth_cm = 0;
+    uint8_t last_level_pct = 0;
+    bool have_last_level = false;
+    bool full_inhibit = false;
+    int full_clear_count = 0;
 
     while (1) {
         cfg_t cfg;
@@ -1300,45 +1439,96 @@ static void control_task(void *arg)
         /* hot-plug: a sensor not present at boot (e.g. the submerged probe on a
          * long cable connected after power-up) gets picked up here so it works
          * in WiFi/Zigbee mode too, not just when present during the boot scan. */
-        if (!baro_ok && lps2x_init(bus, LPS_BARO_ADDR, &baro) == ESP_OK) {
-            baro_ok = true;
+        xSemaphoreTake(g_sensor_mtx, portMAX_DELAY);
+        if (!g_baro_sensor_ok && lps2x_init(g_sensor_bus, LPS_BARO_ADDR, &g_baro_sensor) == ESP_OK) {
+            g_baro_sensor_ok = true;
             ESP_LOGI(TAG, "baro sensor (0x%02x) appeared", LPS_BARO_ADDR);
         }
-        if (!tank_ok && lps2x_init(bus, LPS_TANK_ADDR, &tank) == ESP_OK) {
-            tank_ok = true;
+        if (!g_tank_sensor_ok && lps2x_init(g_sensor_bus, LPS_TANK_ADDR, &g_tank_sensor) == ESP_OK) {
+            g_tank_sensor_ok = true;
             ESP_LOGI(TAG, "tank sensor (0x%02x) appeared", LPS_TANK_ADDR);
         }
+        baro_ok = g_baro_sensor_ok;
+        tank_ok = g_tank_sensor_ok;
 
-        /* read whichever sensors are present (each independent), averaging a
-         * few slow one-shot conversions to calm long wires and startup noise. */
+        /* read whichever sensors are present (each independent), taking the
+         * median of a few one-shot conversions so a single bad zero sample
+         * cannot look like an empty tank. */
         float p_tank = 0, p_baro = 0;
         float t_tank = 0, t_baro = 0;
+        float p_tank_samples[SENSOR_AVG_SAMPLES];
+        float p_baro_samples[SENSOR_AVG_SAMPLES];
+        float t_tank_samples[SENSOR_AVG_SAMPLES];
+        float t_baro_samples[SENSOR_AVG_SAMPLES];
         int baro_n = 0, tank_n = 0;
+        int baro_fresh_n = 0, tank_fresh_n = 0;
         for (int i = 0; i < SENSOR_AVG_SAMPLES; i++) {
             float p = 0;
             float t = 0;
-            if (baro_ok && lps2x_read(&baro, &p, &t) == ESP_OK) {
-                p_baro += p;
-                t_baro += t;
+            if (baro_ok && lps2x_read(&g_baro_sensor, &p, &t) == ESP_OK) {
+                if (sensor_pressure_valid(p)) {
+                    p_baro_samples[baro_n] = p;
+                    t_baro_samples[baro_n] = t;
+                    baro_n++;
+                    baro_fresh_n++;
+                } else if (have_last_baro) {
+                    p_baro_samples[baro_n] = last_p_baro;
+                    t_baro_samples[baro_n] = last_t_baro;
+                    baro_n++;
+                }
+            } else if (baro_ok && have_last_baro) {
+                p_baro_samples[baro_n] = last_p_baro;
+                t_baro_samples[baro_n] = last_t_baro;
                 baro_n++;
             }
-            if (tank_ok && lps2x_read(&tank, &p, &t) == ESP_OK) {
-                p_tank += p;
-                t_tank += t;
+            if (tank_ok && lps2x_read(&g_tank_sensor, &p, &t) == ESP_OK) {
+                if (sensor_pressure_valid(p)) {
+                    p_tank_samples[tank_n] = p;
+                    t_tank_samples[tank_n] = t;
+                    tank_n++;
+                    tank_fresh_n++;
+                } else if (have_last_tank) {
+                    p_tank_samples[tank_n] = last_p_tank;
+                    t_tank_samples[tank_n] = last_t_tank;
+                    tank_n++;
+                }
+            } else if (tank_ok && have_last_tank) {
+                p_tank_samples[tank_n] = last_p_tank;
+                t_tank_samples[tank_n] = last_t_tank;
                 tank_n++;
             }
             if (i + 1 < SENSOR_AVG_SAMPLES) vTaskDelay(pdMS_TO_TICKS(SENSOR_AVG_DELAY_MS));
         }
-        bool baro_rd = baro_n > 0;
-        bool tank_rd = tank_n > 0;
-        if (baro_rd) {
-            p_baro /= (float)baro_n;
-            t_baro /= (float)baro_n;
+        xSemaphoreGive(g_sensor_mtx);
+        bool baro_fresh = baro_fresh_n > 0;
+        bool tank_fresh = tank_fresh_n > 0;
+        if (baro_n > 0) {
+            p_baro = median_float(p_baro_samples, baro_n);
+            t_baro = median_float(t_baro_samples, baro_n);
+            if (baro_fresh) {
+                last_p_baro = p_baro;
+                last_t_baro = t_baro;
+                have_last_baro = true;
+            }
+        } else if (have_last_baro) {
+            p_baro = last_p_baro;
+            t_baro = last_t_baro;
         }
-        if (tank_rd) {
-            p_tank /= (float)tank_n;
-            t_tank /= (float)tank_n;
+        if (tank_n > 0) {
+            p_tank = median_float(p_tank_samples, tank_n);
+            t_tank = median_float(t_tank_samples, tank_n);
+            if (tank_fresh) {
+                last_p_tank = p_tank;
+                last_t_tank = t_tank;
+                have_last_tank = true;
+            }
+        } else if (have_last_tank) {
+            p_tank = last_p_tank;
+            t_tank = last_t_tank;
         }
+        bool baro_rd = baro_n > 0 || have_last_baro;
+        bool tank_rd = tank_n > 0 || have_last_tank;
+        bool level_fresh = baro_fresh && tank_fresh;
         g_baro_pressure_hpa = baro_rd ? (int16_t)lroundf(p_baro) : -1;
         g_tank_pressure_hpa = tank_rd ? (int16_t)lroundf(p_tank) : -1;
         g_baro_pressure_hpa_x100 = baro_rd ? (int32_t)lroundf(p_baro * 100.0f) : -1;
@@ -1348,53 +1538,91 @@ static void control_task(void *arg)
         bool level_ok = false;     /* true only when a real water level is known */
 
         if (baro_rd && tank_rd) {
+            bool sensor_miss_fault = false;
+            if (level_fresh) {
+                fault_count = 0;
+            } else if (++fault_count >= SENSOR_FAULT_LIMIT) {
+                sensor_miss_fault = true;
+            }
+
             /* full hydrostatic measurement: hPa -> Pa -> depth */
             float corrected_delta_hpa = (p_tank - p_baro) - ((float)cfg.air_offset_hpa_x100 / 100.0f);
             float head_pa = corrected_delta_hpa * 100.0f;
             float depth_cm = head_pa / ((float)cfg.density * GRAVITY_MS2) * 100.0f + SENSOR_OFFSET_CM;
             if (depth_cm < 0) depth_cm = 0;
-            g_depth_cm = (int16_t)lroundf(depth_cm);
+            int16_t measured_depth_cm = (int16_t)lroundf(depth_cm);
             int16_t span = cfg.tank_h_cm > 0 ? cfg.tank_h_cm : 1;
             int pct = (int)lroundf(depth_cm * 100.0f / span);
-            g_level_pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+            uint8_t measured_level_pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+            bool sensor_drop_fault = false;
+            if (level_fresh && have_last_level &&
+                measured_depth_cm + SENSOR_MAX_DROP_CM < last_depth_cm) {
+                sensor_drop_fault = true;
+                g_depth_cm = last_depth_cm;
+                g_level_pct = last_level_pct;
+            } else {
+                g_depth_cm = measured_depth_cm;
+                g_level_pct = measured_level_pct;
+            }
+            uint8_t next_fault = 0;
+            bool measured_level_ok = true;
 #if BENCH_REQUIRE_EQUAL_PRESSURE
             if (fabsf(p_tank - p_baro) > BENCH_MAX_DELTA_HPA) {
-                g_fault = 4;        /* 4 = bench sensors disagree */
-                level_ok = false;
-            } else
+                next_fault = 4;     /* 4 = bench sensors disagree */
+                measured_level_ok = false;
+            }
 #endif
-            if (!cfg.calibrated) {
-                g_fault = 5;        /* 5 = setup/calibration incomplete */
-                level_ok = false;
-            } else
-            if (g_depth_cm > cfg.tank_h_cm + MAX_DEPTH_OVER_TANK_CM) {
-                g_fault = 3;        /* 3 = pressure delta is implausible */
+            if (measured_level_ok && !cfg.calibrated) {
+                next_fault = 5;     /* 5 = setup/calibration incomplete */
+                measured_level_ok = false;
+            }
+            if (measured_level_ok && g_depth_cm > cfg.tank_h_cm + MAX_DEPTH_OVER_TANK_CM) {
+                next_fault = 3;     /* 3 = pressure delta is implausible */
+                measured_level_ok = false;
+            }
+            if (sensor_miss_fault || sensor_drop_fault) {
+                g_fault = 1;        /* 1 = repeated missed/invalid sensor reads */
                 level_ok = false;
             } else {
-                g_fault = 0;
-                level_ok = true;
+                g_fault = next_fault;
+                level_ok = measured_level_ok;
+            }
+            if (level_ok && level_fresh) {
+                last_depth_cm = g_depth_cm;
+                last_level_pct = g_level_pct;
+                have_last_level = true;
             }
             g_low_alert = (level_ok && g_depth_cm <= cfg.low_cm) ? 1 : 0;
-            fault_count = 0;
 #if LOG_SENSOR_READINGS
-            ESP_LOGI(TAG, "sensor read: baro=%.2fhPa %.2fC(%d/%d) tank=%.2fhPa %.2fC(%d/%d) depth=%dcm level=%u%% fault=%u",
-                     p_baro, t_baro, baro_n, SENSOR_AVG_SAMPLES,
-                     p_tank, t_tank, tank_n, SENSOR_AVG_SAMPLES,
-                     g_depth_cm, g_level_pct, g_fault);
+            ESP_LOGI(TAG, "sensor read: baro=%.2fhPa %.2fC(%d/%d%s) tank=%.2fhPa %.2fC(%d/%d%s) depth=%dcm level=%u%% fault=%u%s",
+                     p_baro, t_baro, baro_fresh_n, SENSOR_AVG_SAMPLES,
+                     baro_fresh_n == SENSOR_AVG_SAMPLES ? "" : " held",
+                     p_tank, t_tank, tank_fresh_n, SENSOR_AVG_SAMPLES,
+                     tank_fresh_n == SENSOR_AVG_SAMPLES ? "" : " held",
+                     g_depth_cm, g_level_pct, g_fault,
+                     sensor_drop_fault ? " sudden-drop" : "");
 #endif
         } else if (baro_rd || tank_rd) {
             /* DIAGNOSTIC: only one sensor present - cannot measure level.
              * Report that sensor's absolute pressure (hPa, ~1013 at sea level)
              * in 'depth' so it's visible over Zigbee = "this sensor is alive".
              * Relay stays in failsafe (no real level). */
+            bool any_fresh = baro_fresh || tank_fresh;
             g_depth_cm = (int16_t)lroundf(baro_rd ? p_baro : p_tank);
             g_level_pct = 0;
-            g_fault = 2;            /* 2 = single-sensor diagnostic mode */
+            if (any_fresh) {
+                fault_count = 0;
+                g_fault = 2;        /* 2 = single-sensor diagnostic mode */
+            } else if (++fault_count >= SENSOR_FAULT_LIMIT) {
+                g_fault = 1;        /* stale held diagnostic value */
+            } else {
+                g_fault = 2;
+            }
             g_low_alert = 0;
-            fault_count = 0;
 #if LOG_SENSOR_READINGS
-            ESP_LOGW(TAG, "sensor read: only %s OK, pressure=%.2fhPa temp=%.2fC",
-                     baro_rd ? "baro" : "tank", baro_rd ? p_baro : p_tank,
+            ESP_LOGW(TAG, "sensor read: only %s OK%s, pressure=%.2fhPa temp=%.2fC",
+                     baro_rd ? "baro" : "tank", any_fresh ? "" : " (held)",
+                     baro_rd ? p_baro : p_tank,
                      baro_rd ? t_baro : t_tank);
 #endif
         } else {
@@ -1407,12 +1635,35 @@ static void control_task(void *arg)
 #endif
         }
 
+        bool at_or_above_full = baro_rd && tank_rd &&
+            (g_depth_cm >= cfg.full_cm || g_level_pct >= 100);
+        if (at_or_above_full) {
+            if (!full_inhibit) {
+                ESP_LOGW(TAG, "full inhibit -> ON (depth=%dcm level=%u%% full=%dcm); pump held off until %d fresh below-full reads",
+                         g_depth_cm, g_level_pct, cfg.full_cm, FULL_INHIBIT_CLEAR_READINGS);
+            }
+            full_inhibit = true;
+            full_clear_count = 0;
+        } else if (full_inhibit) {
+            if (level_ok && level_fresh && g_depth_cm < cfg.full_cm && g_level_pct < 100) {
+                if (full_clear_count < FULL_INHIBIT_CLEAR_READINGS) full_clear_count++;
+                if (full_clear_count >= FULL_INHIBIT_CLEAR_READINGS) {
+                    full_inhibit = false;
+                    full_clear_count = 0;
+                    ESP_LOGI(TAG, "full inhibit -> OFF after %d fresh below-full reads",
+                             FULL_INHIBIT_CLEAR_READINGS);
+                }
+            } else {
+                full_clear_count = 0;
+            }
+        }
+
         /* ---- decide relay state ---- */
         int64_t now = esp_timer_get_time();
         bool want = g_relay_on;
 
         if (cfg.mode == MODE_ON) {
-            want = true;
+            want = level_ok && level_fresh && !at_or_above_full;
         } else if (cfg.mode == MODE_OFF) {
             want = false;
         } else if (level_ok) {                  /* AUTO with a real water level */
@@ -1427,9 +1678,6 @@ static void control_task(void *arg)
         }
 
         bool locked_out = lockout_is_active(&cfg);
-        if (cfg.mode == MODE_AUTO && locked_out) {
-            want = false;
-        }
 
         /* anti-short-cycle guards (only when actually pump-controlling) */
         if (cfg.mode == MODE_AUTO && level_ok) {
@@ -1441,11 +1689,19 @@ static void control_task(void *arg)
             }
         }
 
+        if (cfg.mode == MODE_AUTO && locked_out) {
+            want = false;
+        }
+        if (full_inhibit) {
+            want = false;
+        }
+
         if (want != g_relay_on) {
             relay_set(want);
             if (want) last_on_us = now; else last_off_us = now;
-            ESP_LOGI(TAG, "relay -> %s (depth=%dcm %d%% mode=%d fault=%d lockout=%u)",
-                     want ? "ON" : "OFF", g_depth_cm, g_level_pct, cfg.mode, g_fault, g_lockout_active);
+            ESP_LOGI(TAG, "relay -> %s (depth=%dcm %d%% mode=%d fault=%d lockout=%u full_inhibit=%u)",
+                     want ? "ON" : "OFF", g_depth_cm, g_level_pct, cfg.mode, g_fault,
+                     g_lockout_active, full_inhibit ? 1 : 0);
         }
 
         zb_push_telemetry();
@@ -2013,6 +2269,8 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
 
     g_cfg_mtx = xSemaphoreCreateMutex();
+    g_sensor_mtx = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK((g_cfg_mtx && g_sensor_mtx) ? ESP_OK : ESP_ERR_NO_MEM);
     cfg_load();
     relay_init();                       /* relay OFF before anything else */
 
