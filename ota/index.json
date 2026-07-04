@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "firebeetle_tank_v1.0.0.41.ota",
-    "fileVersion": 16777257,
-    "fileSize": 1676510,
+    "fileName": "firebeetle_tank_v1.0.0.42.ota",
+    "fileVersion": 16777258,
+    "fileSize": 1681726,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "21547429c96f6072e18a685bab7fd2476eb21fc6f343311d284aa2496608976c646d2f3bf0babbad9f6d9ba3b56135d686cd22b5c6fe66d52fd3c46d590e773b",
-    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.41/firebeetle_tank_v1.0.0.41.ota",
+    "sha512": "b39853e251c6cfcfce0ed7b4aa1d1947fbb98f1a048aec8b81c11a953dec9860c6b911b3f73c4c3d74057da5db84a1f826d9487d0d7c4bac1c7170ca3a2ab129",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.42/firebeetle_tank_v1.0.0.42.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.41: add raw sensor diagnostics and full-level relay inhibit safeguards."
+    "releaseNotes": "Firmware v1.0.42: add clock diagnostics, SNTP resync, and force-on auto-revert at full level."
   }
 ]

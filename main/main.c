@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <stddef.h>
 #include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -113,6 +114,8 @@ static bool g_baro_sensor_ok = false;
 static bool g_tank_sensor_ok = false;
 static void cfg_save(void);
 static bool sensor_pressure_valid(float hpa);
+static void time_sync_start(void);
+static bool time_sync_request_resync(void);
 
 static const cfg_t DEFAULT_CFG = {
     .magic     = 0x544b,
@@ -197,6 +200,9 @@ static uint8_t g_fault     = 0;
 static uint8_t g_low_alert = 0;
 static uint8_t g_lockout_active = 0;
 static uint8_t g_time_valid = 0;
+static time_t g_last_time_sync_epoch = 0;
+static int64_t g_last_time_sync_us = 0;
+static uint32_t g_time_sync_count = 0;
 static bool    g_relay_on  = false;
 static volatile bool g_zb_joined = false;   /* true once on a Zigbee network */
 static volatile int64_t g_join_us = 0;      /* timestamp (us) when we joined   */
@@ -331,10 +337,64 @@ static esp_err_t read_request_body(httpd_req_t *req, char *buf, size_t buf_len)
     return ESP_OK;
 }
 
+static bool clock_is_valid(time_t now)
+{
+    return now >= 1704067200; /* 2024-01-01 UTC: before this, SNTP/RTC is not sane */
+}
+
+static void format_tm_iso(const struct tm *tmv, const char *suffix, char *out, size_t out_len)
+{
+    if (!tmv || out_len == 0) return;
+    int n = snprintf(out, out_len, "%04d-%02d-%02dT%02d:%02d:%02d%s",
+                     tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday,
+                     tmv->tm_hour, tmv->tm_min, tmv->tm_sec, suffix ? suffix : "");
+    if (n < 0 || n >= (int)out_len) out[out_len - 1] = '\0';
+}
+
+static void format_minute_hhmm(uint16_t minute, char *out, size_t out_len)
+{
+    if (out_len == 0) return;
+    if (minute >= 1440) {
+        strlcpy(out, "??:??", out_len);
+        return;
+    }
+    snprintf(out, out_len, "%02u:%02u", (unsigned)(minute / 60), (unsigned)(minute % 60));
+}
+
+static int32_t local_utc_offset_min(const struct tm *utc, const struct tm *local)
+{
+    if (!utc || !local) return 0;
+    struct tm utc_as_local = *utc;
+    struct tm local_copy = *local;
+    time_t utc_epoch_local = mktime(&utc_as_local);
+    time_t local_epoch = mktime(&local_copy);
+    if (utc_epoch_local == (time_t)-1 || local_epoch == (time_t)-1) return 0;
+    return (int32_t)(difftime(local_epoch, utc_epoch_local) / 60.0);
+}
+
+static const char *sntp_status_name(sntp_sync_status_t status)
+{
+    switch (status) {
+        case SNTP_SYNC_STATUS_RESET: return "reset";
+        case SNTP_SYNC_STATUS_COMPLETED: return "completed";
+        case SNTP_SYNC_STATUS_IN_PROGRESS: return "in_progress";
+        default: return "unknown";
+    }
+}
+
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    g_last_time_sync_epoch = tv ? tv->tv_sec : time(NULL);
+    g_last_time_sync_us = esp_timer_get_time();
+    g_time_sync_count++;
+    ESP_LOGI(TAG, "SNTP sync #%lu epoch=%lld", (unsigned long)g_time_sync_count,
+             (long long)g_last_time_sync_epoch);
+}
+
 static bool local_time_minutes(uint16_t *minute_of_day)
 {
     time_t now = time(NULL);
-    if (now < 1704067200) { /* 2024-01-01 UTC: before this, SNTP/RTC is not sane */
+    if (!clock_is_valid(now)) {
         g_time_valid = 0;
         return false;
     }
@@ -915,6 +975,100 @@ static esp_err_t setup_raw_sensor_get(httpd_req_t *req)
     return httpd_resp_send(req, json, n);
 }
 
+static esp_err_t setup_clock_get(httpd_req_t *req)
+{
+    WEB_REQUIRE_AUTH(req);
+
+    cfg_t cfg;
+    xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+    cfg = g_cfg;
+    xSemaphoreGive(g_cfg_mtx);
+
+    time_t now = time(NULL);
+    bool valid = clock_is_valid(now);
+    struct tm utc = {0};
+    struct tm local = {0};
+    char utc_s[32] = "";
+    char local_s[32] = "";
+    char last_sync_s[32] = "";
+    uint16_t utc_minute = 0;
+    uint16_t local_minute = 0;
+    int32_t utc_offset_min = 0;
+
+    if (valid) {
+        gmtime_r(&now, &utc);
+        localtime_r(&now, &local);
+        utc_minute = (uint16_t)(utc.tm_hour * 60 + utc.tm_min);
+        local_minute = (uint16_t)(local.tm_hour * 60 + local.tm_min);
+        utc_offset_min = local_utc_offset_min(&utc, &local);
+        format_tm_iso(&utc, "Z", utc_s, sizeof(utc_s));
+        format_tm_iso(&local, "", local_s, sizeof(local_s));
+    }
+    if (clock_is_valid(g_last_time_sync_epoch)) {
+        struct tm last_utc = {0};
+        gmtime_r(&g_last_time_sync_epoch, &last_utc);
+        format_tm_iso(&last_utc, "Z", last_sync_s, sizeof(last_sync_s));
+    }
+
+    bool lockout_calc_local = cfg.lockout_enabled && cfg.conn_mode == CONN_WIFI && valid &&
+        minute_in_window(local_minute, cfg.lockout_start_min, cfg.lockout_end_min);
+    bool lockout_calc_utc = cfg.lockout_enabled && cfg.conn_mode == CONN_WIFI && valid &&
+        minute_in_window(utc_minute, cfg.lockout_start_min, cfg.lockout_end_min);
+    char local_hhmm[8], utc_hhmm[8], start_hhmm[8], end_hhmm[8];
+    format_minute_hhmm(local_minute, local_hhmm, sizeof(local_hhmm));
+    format_minute_hhmm(utc_minute, utc_hhmm, sizeof(utc_hhmm));
+    format_minute_hhmm(cfg.lockout_start_min, start_hhmm, sizeof(start_hhmm));
+    format_minute_hhmm(cfg.lockout_end_min, end_hhmm, sizeof(end_hhmm));
+
+    bool sntp_enabled = esp_sntp_enabled();
+    sntp_sync_status_t sync_status = esp_sntp_get_sync_status();
+    int64_t since_sync_s = g_last_time_sync_us > 0
+        ? (esp_timer_get_time() - g_last_time_sync_us) / 1000000
+        : -1;
+    const char *server = esp_sntp_getservername(0);
+    const char *tz = getenv("TZ");
+
+    char json[1400];
+    int n = snprintf(json, sizeof(json),
+        "{\"epoch\":%lld,\"valid\":%s,"
+        "\"timezone\":\"%s\",\"timezone_name\":\"%s\",\"utc_offset_min\":%ld,"
+        "\"utc\":\"%s\",\"local\":\"%s\",\"utc_minute\":%u,\"local_minute\":%u,"
+        "\"utc_hhmm\":\"%s\",\"local_hhmm\":\"%s\","
+        "\"lockout_enabled\":%u,\"lockout_start_min\":%u,\"lockout_end_min\":%u,"
+        "\"lockout_start_hhmm\":\"%s\",\"lockout_end_hhmm\":\"%s\","
+        "\"lockout_active\":%u,\"lockout_calc_local\":%s,\"lockout_calc_utc\":%s,"
+        "\"conn_mode\":%u,\"time_valid\":%u,"
+        "\"sntp_enabled\":%s,\"sntp_status\":\"%s\",\"sntp_server\":\"%s\","
+        "\"sntp_sync_interval_ms\":%lu,\"sntp_reachability\":%u,"
+        "\"last_sync_epoch\":%lld,\"last_sync_utc\":\"%s\","
+        "\"seconds_since_last_sync\":%lld,\"sync_count\":%lu}",
+        (long long)now, valid ? "true" : "false",
+        tz ? tz : "", LOCAL_TIMEZONE_NAME, (long)utc_offset_min,
+        utc_s, local_s, utc_minute, local_minute, utc_hhmm, local_hhmm,
+        cfg.lockout_enabled, cfg.lockout_start_min, cfg.lockout_end_min,
+        start_hhmm, end_hhmm,
+        g_lockout_active, lockout_calc_local ? "true" : "false",
+        lockout_calc_utc ? "true" : "false",
+        cfg.conn_mode, g_time_valid,
+        sntp_enabled ? "true" : "false", sntp_status_name(sync_status),
+        server ? server : "",
+        (unsigned long)esp_sntp_get_sync_interval(), esp_sntp_getreachability(0),
+        (long long)g_last_time_sync_epoch, last_sync_s,
+        (long long)since_sync_s, (unsigned long)g_time_sync_count);
+    if (n < 0) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Clock format failed");
+    if (n >= (int)sizeof(json)) n = strlen(json);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, n);
+}
+
+static esp_err_t setup_clock_resync_post(httpd_req_t *req)
+{
+    WEB_REQUIRE_AUTH(req);
+    bool ok = time_sync_request_resync();
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, ok ? "{\"resync_requested\":true}" : "{\"resync_requested\":false}");
+}
+
 static esp_err_t setup_root_get(httpd_req_t *req)
 {
     WEB_REQUIRE_AUTH(req);
@@ -1152,6 +1306,8 @@ static void web_server_start(void)
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/", .method=HTTP_GET, .handler=setup_root_get });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/status", .method=HTTP_GET, .handler=setup_status_get });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/raw_sensor", .method=HTTP_GET, .handler=setup_raw_sensor_get });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/clock", .method=HTTP_GET, .handler=setup_clock_get });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/clock_resync", .method=HTTP_POST, .handler=setup_clock_resync_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/open_air", .method=HTTP_POST, .handler=setup_open_air_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/full_tank", .method=HTTP_POST, .handler=setup_full_tank_post });
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){ .uri="/api/config", .method=HTTP_POST, .handler=setup_config_post });
@@ -1159,15 +1315,31 @@ static void web_server_start(void)
     mdns_start();
 }
 
+static void time_sync_configure(void)
+{
+    setenv("TZ", LOCAL_TIMEZONE_POSIX, 1);
+    tzset();
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+    esp_sntp_set_sync_interval(SNTP_SYNC_INTERVAL_MS);
+}
+
 static void time_sync_start(void)
 {
-    setenv("TZ", "CAT-2", 1); /* Africa/Harare: UTC+2, no DST */
-    tzset();
+    time_sync_configure();
     if (esp_sntp_enabled()) return;
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_init();
-    ESP_LOGI(TAG, "SNTP time sync started");
+    ESP_LOGI(TAG, "SNTP time sync started: server=pool.ntp.org tz=%s interval=%lums",
+             LOCAL_TIMEZONE_POSIX, (unsigned long)SNTP_SYNC_INTERVAL_MS);
+}
+
+static bool time_sync_request_resync(void)
+{
+    time_sync_start();
+    if (!esp_sntp_enabled()) return false;
+    return esp_sntp_restart();
 }
 
 static void setup_portal_start(void)
@@ -1655,6 +1827,23 @@ static void control_task(void *arg)
                 }
             } else {
                 full_clear_count = 0;
+            }
+        }
+
+        if (at_or_above_full && cfg.mode == MODE_ON) {
+            bool mode_changed = false;
+            xSemaphoreTake(g_cfg_mtx, portMAX_DELAY);
+            if (g_cfg.mode == MODE_ON) {
+                g_cfg.mode = MODE_AUTO;
+                mode_changed = true;
+            }
+            xSemaphoreGive(g_cfg_mtx);
+            if (mode_changed) {
+                cfg.mode = MODE_AUTO;
+                cfg_save();
+                zb_push_mode(MODE_AUTO);
+                ESP_LOGW(TAG, "force-on reverted to AUTO at full level (depth=%dcm level=%u%% full=%dcm)",
+                         g_depth_cm, g_level_pct, cfg.full_cm);
             }
         }
 

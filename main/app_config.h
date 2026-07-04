@@ -63,6 +63,9 @@
 #define PUMP_MIN_ON_MS          0      /* optional min run time (0 = disabled)  */
 #define DEFAULT_LOCKOUT_START_MIN 1320 /* 22:00 local time */
 #define DEFAULT_LOCKOUT_END_MIN   300  /* 05:00 local time */
+#define LOCAL_TIMEZONE_POSIX    "CAT-2" /* Africa/Harare UTC+2, POSIX sign */
+#define LOCAL_TIMEZONE_NAME     "Africa/Harare"
+#define SNTP_SYNC_INTERVAL_MS   (30UL * 60UL * 1000UL)
 #define LOG_SENSOR_READINGS     1      /* diagnostic serial log of pressure/depth */
 
 /* ---------- Local setup portal ---------- */
@@ -151,10 +154,10 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x01000029   /* 1.0.0.41 - raw sensor endpoint */
+#define OTA_FW_VERSION      0x0100002A   /* 1.0.0.42 - clock diagnostics */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101
 #define OTA_MAX_DATA_SIZE   223          /* max OTA block payload bytes */
 #define OTA_QUERY_INTERVAL_S 60          /* delay after server discovery */
-#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.39"
+#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.42"
