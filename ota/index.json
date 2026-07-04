@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "firebeetle_tank_v1.0.0.39.ota",
-    "fileVersion": 16777255,
-    "fileSize": 1672958,
+    "fileName": "firebeetle_tank_v1.0.0.41.ota",
+    "fileVersion": 16777257,
+    "fileSize": 1676510,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "45007c8e8f2f7d6537fabfe074a700bd47db6f7653bd87b5a6010fe8a0634944520b79f0c08f3c1634900d9e7b6f87e6d2cb3681748b2503b3318259638b8f97",
-    "url": "https://raw.githubusercontent.com/moozw/firebeetle-tank-zigbee/codex/tank-controller-v1.0.0.38/ota/firebeetle_tank_v1.0.0.39.ota",
+    "sha512": "21547429c96f6072e18a685bab7fd2476eb21fc6f343311d284aa2496608976c646d2f3bf0babbad9f6d9ba3b56135d686cd22b5c6fe66d52fd3c46d590e773b",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.41/firebeetle_tank_v1.0.0.41.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.39: batch Zigbee OTA flash writes to keep the C5 radio responsive."
+    "releaseNotes": "Firmware v1.0.41: add raw sensor diagnostics and full-level relay inhibit safeguards."
   }
 ]
