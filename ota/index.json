@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "firebeetle_tank_v1.0.0.42.ota",
-    "fileVersion": 16777258,
-    "fileSize": 1681726,
+    "fileName": "firebeetle_tank_v1.0.0.43.ota",
+    "fileVersion": 16777259,
+    "fileSize": 1682718,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "b39853e251c6cfcfce0ed7b4aa1d1947fbb98f1a048aec8b81c11a953dec9860c6b911b3f73c4c3d74057da5db84a1f826d9487d0d7c4bac1c7170ca3a2ab129",
-    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.42/firebeetle_tank_v1.0.0.42.ota",
+    "sha512": "2ec3b34649975d276a7baf7fc48764c382a2019325bd8adfc1f5c62fdd75c248867fc63f5f098316a462665bc75aba973e10c46dc6b1f17ce08eca01178099f3",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.43/firebeetle_tank_v1.0.0.43.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.42: add clock diagnostics, SNTP resync, and force-on auto-revert at full level."
+    "releaseNotes": "Firmware v1.0.43: show current controller time and add a reset time button on the web page."
   }
 ]
