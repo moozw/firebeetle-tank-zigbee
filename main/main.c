@@ -919,6 +919,8 @@ static esp_err_t setup_raw_sensor_get(httpd_req_t *req)
     bool tank_present = false;
     esp_err_t baro_err = ESP_ERR_INVALID_STATE;
     esp_err_t tank_err = ESP_ERR_INVALID_STATE;
+    esp_err_t baro_probe_err = ESP_ERR_INVALID_STATE;
+    esp_err_t tank_probe_err = ESP_ERR_INVALID_STATE;
     float p_baro = 0, t_baro = 0;
     float p_tank = 0, t_tank = 0;
 
@@ -927,6 +929,8 @@ static esp_err_t setup_raw_sensor_get(httpd_req_t *req)
         if (ready) {
             baro_present = g_baro_sensor_ok;
             tank_present = g_tank_sensor_ok;
+            baro_probe_err = i2c_master_probe(g_sensor_bus, LPS_BARO_ADDR, 50);
+            tank_probe_err = i2c_master_probe(g_sensor_bus, LPS_TANK_ADDR, 50);
             baro_err = baro_present ? lps2x_read(&g_baro_sensor, &p_baro, &t_baro) : ESP_ERR_NOT_FOUND;
             tank_err = tank_present ? lps2x_read(&g_tank_sensor, &p_tank, &t_tank) : ESP_ERR_NOT_FOUND;
         }
@@ -955,17 +959,19 @@ static esp_err_t setup_raw_sensor_get(httpd_req_t *req)
     json_float_or_null(delta, sizeof(delta), level_ok, delta_hpa);
     json_float_or_null(depth, sizeof(depth), level_ok, depth_cm);
 
-    char json[900];
+    char json[1100];
     int n = snprintf(json, sizeof(json),
         "{\"raw\":true,\"ready\":%s,"
-        "\"baro\":{\"addr\":%u,\"present\":%s,\"ok\":%s,\"err\":\"%s\",\"hpa\":%s,\"temp_c\":%s,\"valid\":%s},"
-        "\"tank\":{\"addr\":%u,\"present\":%s,\"ok\":%s,\"err\":\"%s\",\"hpa\":%s,\"temp_c\":%s,\"valid\":%s},"
+        "\"baro\":{\"addr\":%u,\"probe_ok\":%s,\"probe_err\":\"%s\",\"present\":%s,\"ok\":%s,\"err\":\"%s\",\"hpa\":%s,\"temp_c\":%s,\"valid\":%s},"
+        "\"tank\":{\"addr\":%u,\"probe_ok\":%s,\"probe_err\":\"%s\",\"present\":%s,\"ok\":%s,\"err\":\"%s\",\"hpa\":%s,\"temp_c\":%s,\"valid\":%s},"
         "\"level_ok\":%s,\"delta_hpa\":%s,\"depth_cm\":%s,\"level_pct\":%d,"
         "\"controller_fault\":%u,\"controller_relay\":%s}",
         ready ? "true" : "false",
-        LPS_BARO_ADDR, baro_present ? "true" : "false", baro_ok ? "true" : "false",
+        LPS_BARO_ADDR, baro_probe_err == ESP_OK ? "true" : "false", esp_err_to_name(baro_probe_err),
+        baro_present ? "true" : "false", baro_ok ? "true" : "false",
         esp_err_to_name(baro_err), baro_hpa, baro_temp, baro_valid ? "true" : "false",
-        LPS_TANK_ADDR, tank_present ? "true" : "false", tank_ok ? "true" : "false",
+        LPS_TANK_ADDR, tank_probe_err == ESP_OK ? "true" : "false", esp_err_to_name(tank_probe_err),
+        tank_present ? "true" : "false", tank_ok ? "true" : "false",
         esp_err_to_name(tank_err), tank_hpa, tank_temp, tank_valid ? "true" : "false",
         level_ok ? "true" : "false", delta, depth, pct,
         g_fault, g_relay_on ? "true" : "false");

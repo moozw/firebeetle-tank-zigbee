@@ -49,28 +49,42 @@ esp_err_t lps2x_bus_init(i2c_master_bus_handle_t *out_bus)
 
 esp_err_t lps2x_init(i2c_master_bus_handle_t bus, uint8_t addr, lps2x_t *out)
 {
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->dev = NULL;
+    out->addr = addr;
+
     i2c_device_config_t dcfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = addr,
         .scl_speed_hz = I2C_FREQ_HZ,
     };
-    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &dcfg, &out->dev), TAG, "add dev 0x%02x", addr);
-    out->addr = addr;
+    esp_err_t err = i2c_master_bus_add_device(bus, &dcfg, &out->dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "add dev 0x%02x failed: %s", addr, esp_err_to_name(err));
+        return err;
+    }
 
     uint8_t id = 0;
-    esp_err_t err = rd(out, REG_WHO_AM_I, &id, 1);
+    err = rd(out, REG_WHO_AM_I, &id, 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "0x%02x: no ack", addr);
-        return err;
+        goto fail;
     }
     if (id != WHO_AM_I_VAL) {
         ESP_LOGE(TAG, "0x%02x: WHO_AM_I=0x%02x (expected 0x%02x)", addr, id, WHO_AM_I_VAL);
-        return ESP_ERR_NOT_FOUND;
+        err = ESP_ERR_NOT_FOUND;
+        goto fail;
     }
 
     /* Soft reset, then enable register auto-increment for block reads.
      * Leave ODR = 0 (power-down / one-shot mode). */
-    ESP_RETURN_ON_ERROR(wr(out, REG_CTRL_REG2, CTRL2_SWRESET), TAG, "reset");
+    err = wr(out, REG_CTRL_REG2, CTRL2_SWRESET);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "0x%02x: reset failed: %s", addr, esp_err_to_name(err));
+        goto fail;
+    }
     for (int i = 0; i < 20; i++) {
         uint8_t ctrl2 = 0;
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -78,10 +92,28 @@ esp_err_t lps2x_init(i2c_master_bus_handle_t bus, uint8_t addr, lps2x_t *out)
             break;
         }
     }
-    ESP_RETURN_ON_ERROR(wr(out, REG_CTRL_REG2, CTRL2_IF_ADD_INC), TAG, "if_add_inc");
-    ESP_RETURN_ON_ERROR(wr(out, REG_CTRL_REG1, CTRL1_BDU), TAG, "ctrl1");
+    err = wr(out, REG_CTRL_REG2, CTRL2_IF_ADD_INC);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "0x%02x: if_add_inc failed: %s", addr, esp_err_to_name(err));
+        goto fail;
+    }
+    err = wr(out, REG_CTRL_REG1, CTRL1_BDU);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "0x%02x: ctrl1 failed: %s", addr, esp_err_to_name(err));
+        goto fail;
+    }
     ESP_LOGI(TAG, "0x%02x: LPS2x online", addr);
     return ESP_OK;
+
+fail:
+    if (out->dev) {
+        esp_err_t rm_err = i2c_master_bus_rm_device(out->dev);
+        if (rm_err != ESP_OK) {
+            ESP_LOGW(TAG, "0x%02x: failed to release I2C handle: %s", addr, esp_err_to_name(rm_err));
+        }
+        out->dev = NULL;
+    }
+    return err;
 }
 
 esp_err_t lps2x_read(lps2x_t *s, float *hpa, float *temp_c)
