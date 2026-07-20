@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "firebeetle_tank_v1.0.0.46.ota",
-    "fileVersion": 16777262,
-    "fileSize": 1684286,
+    "fileName": "firebeetle_tank_v1.0.0.47.ota",
+    "fileVersion": 16777263,
+    "fileSize": 1684350,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "f81ead027c7a0d105576bf272a25292b5e686f5d02c6075398d050acc48aa12371da16d2387d76c59c33a519ecf39a93d796a04da8fa8938a540abf0f7fe4811",
-    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.46/firebeetle_tank_v1.0.0.46.ota",
+    "sha512": "3889b4bf43d21dd775e57342583f61034703b56054e2ec9785e2aaaff93ced0a1b272a9dc0b29cd607a93c3a82c026aa196bd41b9ac4355dd6094ed1841fcf26",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.47/firebeetle_tank_v1.0.0.47.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.46: quiet sensor startup recovery once a sensor is attached."
+    "releaseNotes": "Firmware v1.0.47: allow authenticated restoration of saved calibration state."
   }
 ]

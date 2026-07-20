@@ -1227,6 +1227,8 @@ static esp_err_t setup_config_post(httpd_req_t *req)
     cfg.full_cm = form_int(form, "full", cfg.full_cm);
     cfg.tank_h_cm = form_int(form, "height", cfg.tank_h_cm);
     cfg.density = form_int(form, "density", cfg.density);
+    cfg.calibrated = form_int(form, "calibrated", cfg.calibrated) ? 1 : 0;
+    cfg.air_offset_hpa_x100 = form_int(form, "air_offset_hpa_x100", cfg.air_offset_hpa_x100);
     cfg.mode = form_int(form, "mode", cfg.mode);
     cfg.conn_mode = form_int(form, "conn", cfg.conn_mode);
     cfg.lockout_enabled = form_int(form, "lock", cfg.lockout_enabled) ? 1 : 0;
