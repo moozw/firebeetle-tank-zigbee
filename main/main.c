@@ -1614,7 +1614,7 @@ static void sensor_boot_recover(bool *baro_ok, bool *tank_ok)
     int64_t start_us = esp_timer_get_time();
     bool first = true;
     while (1) {
-        if (!first) {
+        if (!first && !*baro_ok && !*tank_ok) {
             esp_err_t err = i2c_master_bus_reset(g_sensor_bus);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "I2C bus reset failed during startup recovery: %s", esp_err_to_name(err));
