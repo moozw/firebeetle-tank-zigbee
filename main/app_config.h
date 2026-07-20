@@ -50,6 +50,9 @@
 /* delay app->stack ZCL traffic after join so the coordinator interview finishes
  * first; pushing reports mid-interview asserts the stack and reboots the device */
 #define TELEMETRY_START_DELAY_US (30LL * 1000000)
+#define SENSOR_BOOT_SETTLE_MS   2000   /* let 3V3/I2C sensors settle after power restore */
+#define SENSOR_BOOT_RETRY_MS    30000  /* keep recovering sensors before first steady fault */
+#define SENSOR_BOOT_RETRY_STEP_MS 1000 /* bus reset/retry cadence during startup */
 #define SENSOR_FAULT_LIMIT      3      /* consecutive bad reads -> failsafe OFF */
 #define SENSOR_AVG_SAMPLES      3      /* one-shot readings per displayed sample */
 #define SENSOR_AVG_DELAY_MS     250    /* rest between one-shot conversions      */
@@ -154,10 +157,10 @@
 /* Bump OTA_FW_VERSION for every release you want to push over the air, then
  * rebuild and run tools/make_ota.py with the same version. Z2M offers the
  * update when the packaged .ota version is higher than what the device runs. */
-#define OTA_FW_VERSION      0x0100002C   /* 1.0.0.44 - I2C fault diagnostics */
+#define OTA_FW_VERSION      0x0100002D   /* 1.0.0.45 - sensor startup recovery */
 #define OTA_MANUF_CODE      0x1224       /* OTA manufacturer code */
 #define OTA_IMAGE_TYPE      0x1011       /* OTA image type id     */
 #define OTA_HW_VERSION      0x0101
 #define OTA_MAX_DATA_SIZE   223          /* max OTA block payload bytes */
 #define OTA_QUERY_INTERVAL_S 60          /* delay after server discovery */
-#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.44"
+#define OTA_VERSION_ZCL_STRING "\x08""1.0.0.45"

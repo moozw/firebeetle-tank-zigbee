@@ -1312,6 +1312,7 @@ static void web_server_start(void)
 {
     if (s_httpd) return;
     httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
+    http_cfg.max_uri_handlers = 12;
     http_cfg.lru_purge_enable = true;
     http_cfg.stack_size = 8192;
     ESP_ERROR_CHECK(httpd_start(&s_httpd, &http_cfg));
@@ -1577,11 +1578,8 @@ static void button_task(void *arg)
 }
 
 /* ---------------------------- control task ------------------------------ */
-static void control_task(void *arg)
+static int sensor_scan_log(void)
 {
-    ESP_ERROR_CHECK(lps2x_bus_init(&g_sensor_bus));
-
-    /* one-shot I2C scan to help confirm wiring / actual sensor addresses */
     ESP_LOGI(TAG, "I2C scan on SDA=%d SCL=%d ...", I2C_SDA_GPIO, I2C_SCL_GPIO);
     int found = 0;
     for (uint8_t a = 0x08; a < 0x78; a++) {
@@ -1591,13 +1589,70 @@ static void control_task(void *arg)
         }
     }
     if (found == 0) ESP_LOGW(TAG, "  no I2C devices found (sensors connected/powered?)");
+    return found;
+}
 
-    xSemaphoreTake(g_sensor_mtx, portMAX_DELAY);
-    g_baro_sensor_ok = (lps2x_init(g_sensor_bus, LPS_BARO_ADDR, &g_baro_sensor) == ESP_OK);
-    g_tank_sensor_ok = (lps2x_init(g_sensor_bus, LPS_TANK_ADDR, &g_tank_sensor) == ESP_OK);
-    bool baro_ok = g_baro_sensor_ok;
-    bool tank_ok = g_tank_sensor_ok;
-    xSemaphoreGive(g_sensor_mtx);
+static void sensor_try_init_missing_locked(bool *baro_ok, bool *tank_ok)
+{
+    if (!g_baro_sensor_ok && lps2x_init(g_sensor_bus, LPS_BARO_ADDR, &g_baro_sensor) == ESP_OK) {
+        g_baro_sensor_ok = true;
+        ESP_LOGI(TAG, "baro sensor (0x%02x) appeared", LPS_BARO_ADDR);
+    }
+    if (!g_tank_sensor_ok && lps2x_init(g_sensor_bus, LPS_TANK_ADDR, &g_tank_sensor) == ESP_OK) {
+        g_tank_sensor_ok = true;
+        ESP_LOGI(TAG, "tank sensor (0x%02x) appeared", LPS_TANK_ADDR);
+    }
+    if (baro_ok) *baro_ok = g_baro_sensor_ok;
+    if (tank_ok) *tank_ok = g_tank_sensor_ok;
+}
+
+static void sensor_boot_recover(bool *baro_ok, bool *tank_ok)
+{
+    ESP_LOGI(TAG, "sensor startup settle for %u ms", SENSOR_BOOT_SETTLE_MS);
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_BOOT_SETTLE_MS));
+
+    int64_t start_us = esp_timer_get_time();
+    bool first = true;
+    while (1) {
+        if (!first) {
+            esp_err_t err = i2c_master_bus_reset(g_sensor_bus);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "I2C bus reset failed during startup recovery: %s", esp_err_to_name(err));
+            }
+        }
+        first = false;
+        sensor_scan_log();
+
+        xSemaphoreTake(g_sensor_mtx, portMAX_DELAY);
+        sensor_try_init_missing_locked(baro_ok, tank_ok);
+        xSemaphoreGive(g_sensor_mtx);
+
+        if (*baro_ok && *tank_ok) {
+            ESP_LOGI(TAG, "both sensors ready after startup recovery");
+            return;
+        }
+
+        int64_t elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
+        if (elapsed_ms >= SENSOR_BOOT_RETRY_MS) {
+            ESP_LOGW(TAG, "startup sensor recovery timed out after %lld ms: baro=%s tank=%s",
+                     (long long)elapsed_ms, *baro_ok ? "OK" : "absent",
+                     *tank_ok ? "OK" : "absent");
+            return;
+        }
+
+        ESP_LOGW(TAG, "startup sensor recovery retry: baro=%s tank=%s",
+                 *baro_ok ? "OK" : "absent", *tank_ok ? "OK" : "absent");
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_BOOT_RETRY_STEP_MS));
+    }
+}
+
+static void control_task(void *arg)
+{
+    ESP_ERROR_CHECK(lps2x_bus_init(&g_sensor_bus));
+
+    bool baro_ok = false;
+    bool tank_ok = false;
+    sensor_boot_recover(&baro_ok, &tank_ok);
     ESP_LOGI(TAG, "sensors: baro(0x%02x)=%s  tank(0x%02x)=%s", LPS_BARO_ADDR,
              baro_ok ? "OK" : "absent", LPS_TANK_ADDR, tank_ok ? "OK" : "absent");
     if (!baro_ok && !tank_ok) ESP_LOGW(TAG, "no sensors - relay stays in failsafe OFF");
@@ -1624,16 +1679,7 @@ static void control_task(void *arg)
          * long cable connected after power-up) gets picked up here so it works
          * in WiFi/Zigbee mode too, not just when present during the boot scan. */
         xSemaphoreTake(g_sensor_mtx, portMAX_DELAY);
-        if (!g_baro_sensor_ok && lps2x_init(g_sensor_bus, LPS_BARO_ADDR, &g_baro_sensor) == ESP_OK) {
-            g_baro_sensor_ok = true;
-            ESP_LOGI(TAG, "baro sensor (0x%02x) appeared", LPS_BARO_ADDR);
-        }
-        if (!g_tank_sensor_ok && lps2x_init(g_sensor_bus, LPS_TANK_ADDR, &g_tank_sensor) == ESP_OK) {
-            g_tank_sensor_ok = true;
-            ESP_LOGI(TAG, "tank sensor (0x%02x) appeared", LPS_TANK_ADDR);
-        }
-        baro_ok = g_baro_sensor_ok;
-        tank_ok = g_tank_sensor_ok;
+        sensor_try_init_missing_locked(&baro_ok, &tank_ok);
 
         /* read whichever sensors are present (each independent), taking the
          * median of a few one-shot conversions so a single bad zero sample

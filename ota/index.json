@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "firebeetle_tank_v1.0.0.44.ota",
-    "fileVersion": 16777260,
-    "fileSize": 1683102,
+    "fileName": "firebeetle_tank_v1.0.0.45.ota",
+    "fileVersion": 16777261,
+    "fileSize": 1684286,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "39d36e4fea1b70c5d12aa54294d10d54bbde36bdf4e2f008b8bc43cfcab81fefc2841053aa573c714c91e0bf652199d5e87387d753fb7a492cf61efdc64cbf5f",
-    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.44/firebeetle_tank_v1.0.0.44.ota",
+    "sha512": "9b4db239a9a86333c1bc75ca3e3d3958af1f4a55085416a70641c402ecc0465918d6967f1590fb1886fbacc65a334af3218f7d014f9f42d5f31aa8ac70707aa8",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.45/firebeetle_tank_v1.0.0.45.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.44: clean up failed I2C sensor probes and add direct raw sensor probe diagnostics."
+    "releaseNotes": "Firmware v1.0.45: add sensor startup settle/recovery retries after power restore."
   }
 ]
