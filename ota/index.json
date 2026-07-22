@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "firebeetle_tank_v1.0.0.48.ota",
-    "fileVersion": 16777264,
+    "fileName": "firebeetle_tank_v1.0.0.49.ota",
+    "fileVersion": 16777265,
     "fileSize": 1684910,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "9467b8311a5ed92ec62d1f73ce19c0055dd055e985f0b8ec3c7c991868193ae790cdbf81411e21a6c6311b29d949274baffe6e5d73741639578c9ac020dd70bd",
-    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.48/firebeetle_tank_v1.0.0.48.ota",
+    "sha512": "e1038153055da7c6987fbddd6b12daa01fef5872fe752c51328b56a5d7384af94a4eb79f9df69a9650c1858550360a30f1532b7b8f0338aa71997e19479ab3ac",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.49/firebeetle_tank_v1.0.0.49.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.48: recover failed I2C sensor handles after repeated read faults."
+    "releaseNotes": "Firmware v1.0.49: slow I2C bus to 5 kHz for marginal sensor wiring."
   }
 ]
