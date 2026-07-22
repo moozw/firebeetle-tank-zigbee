@@ -1,13 +1,13 @@
 [
   {
-    "fileName": "firebeetle_tank_v1.0.0.47.ota",
-    "fileVersion": 16777263,
-    "fileSize": 1684350,
+    "fileName": "firebeetle_tank_v1.0.0.48.ota",
+    "fileVersion": 16777264,
+    "fileSize": 1684910,
     "manufacturerCode": 4644,
     "imageType": 4113,
-    "sha512": "3889b4bf43d21dd775e57342583f61034703b56054e2ec9785e2aaaff93ced0a1b272a9dc0b29cd607a93c3a82c026aa196bd41b9ac4355dd6094ed1841fcf26",
-    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.47/firebeetle_tank_v1.0.0.47.ota",
+    "sha512": "9467b8311a5ed92ec62d1f73ce19c0055dd055e985f0b8ec3c7c991868193ae790cdbf81411e21a6c6311b29d949274baffe6e5d73741639578c9ac020dd70bd",
+    "url": "https://github.com/moozw/firebeetle-tank-zigbee/releases/download/v1.0.48/firebeetle_tank_v1.0.0.48.ota",
     "otaHeaderString": "FB2-C5-TANK",
-    "releaseNotes": "Firmware v1.0.47: allow authenticated restoration of saved calibration state."
+    "releaseNotes": "Firmware v1.0.48: recover failed I2C sensor handles after repeated read faults."
   }
 ]

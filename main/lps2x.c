@@ -116,6 +116,22 @@ fail:
     return err;
 }
 
+esp_err_t lps2x_deinit(lps2x_t *s)
+{
+    if (!s || !s->dev) {
+        return ESP_OK;
+    }
+
+    uint8_t addr = s->addr;
+    esp_err_t err = i2c_master_bus_rm_device(s->dev);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "0x%02x: failed to release I2C handle: %s", addr, esp_err_to_name(err));
+    }
+    s->dev = NULL;
+    s->addr = 0;
+    return err;
+}
+
 esp_err_t lps2x_read(lps2x_t *s, float *hpa, float *temp_c)
 {
     /* kick a one-shot conversion */

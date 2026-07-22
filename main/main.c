@@ -1608,6 +1608,16 @@ static void sensor_try_init_missing_locked(bool *baro_ok, bool *tank_ok)
     if (tank_ok) *tank_ok = g_tank_sensor_ok;
 }
 
+static void sensor_drop_locked(lps2x_t *sensor, bool *sensor_ok, const char *name, uint8_t addr)
+{
+    if (!sensor_ok || !*sensor_ok) {
+        return;
+    }
+    lps2x_deinit(sensor);
+    *sensor_ok = false;
+    ESP_LOGW(TAG, "%s sensor (0x%02x) read fault; released handle for re-detect", name, addr);
+}
+
 static void sensor_boot_recover(bool *baro_ok, bool *tank_ok)
 {
     ESP_LOGI(TAG, "sensor startup settle for %u ms", SENSOR_BOOT_SETTLE_MS);
@@ -1661,6 +1671,8 @@ static void control_task(void *arg)
     else if (!baro_ok || !tank_ok) ESP_LOGW(TAG, "single sensor only - level not measurable (diagnostic)");
 
     int fault_count = 0;
+    int baro_read_fail_count = 0;
+    int tank_read_fail_count = 0;
     int64_t last_off_us = 0, last_on_us = 0;
     float last_p_tank = 0, last_p_baro = 0;
     float last_t_tank = 0, last_t_baro = 0;
@@ -1734,6 +1746,36 @@ static void control_task(void *arg)
         xSemaphoreGive(g_sensor_mtx);
         bool baro_fresh = baro_fresh_n > 0;
         bool tank_fresh = tank_fresh_n > 0;
+        if (baro_ok && !baro_fresh) {
+            if (++baro_read_fail_count >= SENSOR_FAULT_LIMIT) {
+                xSemaphoreTake(g_sensor_mtx, portMAX_DELAY);
+                sensor_drop_locked(&g_baro_sensor, &g_baro_sensor_ok, "baro", LPS_BARO_ADDR);
+                xSemaphoreGive(g_sensor_mtx);
+                baro_ok = false;
+                baro_n = 0;
+                baro_fresh_n = 0;
+                baro_fresh = false;
+                have_last_baro = false;
+                baro_read_fail_count = 0;
+            }
+        } else {
+            baro_read_fail_count = 0;
+        }
+        if (tank_ok && !tank_fresh) {
+            if (++tank_read_fail_count >= SENSOR_FAULT_LIMIT) {
+                xSemaphoreTake(g_sensor_mtx, portMAX_DELAY);
+                sensor_drop_locked(&g_tank_sensor, &g_tank_sensor_ok, "tank", LPS_TANK_ADDR);
+                xSemaphoreGive(g_sensor_mtx);
+                tank_ok = false;
+                tank_n = 0;
+                tank_fresh_n = 0;
+                tank_fresh = false;
+                have_last_tank = false;
+                tank_read_fail_count = 0;
+            }
+        } else {
+            tank_read_fail_count = 0;
+        }
         if (baro_n > 0) {
             p_baro = median_float(p_baro_samples, baro_n);
             t_baro = median_float(t_baro_samples, baro_n);

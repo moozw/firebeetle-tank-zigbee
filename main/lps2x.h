@@ -23,6 +23,9 @@ esp_err_t lps2x_bus_init(i2c_master_bus_handle_t *out_bus);
 /* Attach one sensor at the given 7-bit address and verify WHO_AM_I. */
 esp_err_t lps2x_init(i2c_master_bus_handle_t bus, uint8_t addr, lps2x_t *out);
 
+/* Release a sensor handle so it can be re-detected after an I2C fault. */
+esp_err_t lps2x_deinit(lps2x_t *s);
+
 /* Trigger a one-shot conversion and return pressure in hPa (and temp in C if
  * temp_c != NULL). Returns ESP_OK on a valid reading. */
 esp_err_t lps2x_read(lps2x_t *s, float *hpa, float *temp_c);
